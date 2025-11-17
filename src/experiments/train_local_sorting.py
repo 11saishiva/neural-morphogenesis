@@ -4,7 +4,6 @@ from torch.utils.tensorboard import SummaryWriter
 from src.envs.wrappers import SortingEnv
 from src.agents.ppo import PatchActorCritic, compute_gae, ppo_update
 
-
 from src.agents.neuro_fuzzy import NeuroFuzzyActorCritic
 from src.utils.viz import visualize_sequence
 from src.utils.metrics import interfacial_energy, motion_penalty
