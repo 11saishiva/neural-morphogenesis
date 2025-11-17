@@ -10,8 +10,8 @@ from src.utils.viz import visualize_sequence
 from src.utils.metrics import interfacial_energy, motion_penalty
 
 # ------------------ hyperparameters ------------------
-H, W = 64, 64
-BATCH = 2
+H, W = 32, 32 #H, W = 64, 64
+BATCH = 1 #BATCH = 2
 T_STEPS = 32
 PATCH_SIZE = 5
 ACTION_DIM = 3
