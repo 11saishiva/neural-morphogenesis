@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+visuals/
+.idea/
+.vscode/
+*.log
+*.gif
+*.mp4
+.DS_Store
+.env
