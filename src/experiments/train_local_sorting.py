@@ -210,7 +210,7 @@ def safe_ppo_update(policy, optimizer,
 
             # call original ppo_update (it expects tensors on DEVICE)
             logs = ppo_update(policy=policy, optimizer=optimizer,
-                              obs=obs_mb,
+                              obs_patches=obs_mb,
                               actions=actions_mb,
                               logp_old=logp_mb,
                               returns=returns_mb,
