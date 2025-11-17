@@ -160,7 +160,7 @@ BATCH = 1
 T_STEPS = 8
 
 # patch / model sizes (small)
-PATCH_SIZE = 3
+PATCH_SIZE = 5
 ACTION_DIM = 3
 GAMMA = 0.99
 LAM = 0.95
