@@ -187,6 +187,7 @@ def flatten_patches(patches):
     T, B, N, C, h, w = patches.shape
     return patches.view(T * B * N, C, h, w)
 
+
 def safe_ppo_update(policy, optimizer,
                     obs_cpu, actions_cpu, logp_old_cpu, returns_cpu, advantages_cpu,
                     clip_ratio=0.2, value_coef=0.5, entropy_coef=0.01,
@@ -194,6 +195,7 @@ def safe_ppo_update(policy, optimizer,
     """
     Stream CPU-stored data in small minibatches to GPU and call the existing ppo_update.
     This avoids moving the entire rollout onto the GPU at once.
+
     obs_cpu, actions_cpu, ... are CPU tensors shaped [S, ...]
     """
     S = obs_cpu.shape[0]
@@ -208,22 +210,21 @@ def safe_ppo_update(policy, optimizer,
             returns_mb = returns_cpu[batch_idx].to(DEVICE, non_blocking=True)
             advs_mb = advantages_cpu[batch_idx].to(DEVICE, non_blocking=True)
 
-            # call original ppo_update (it expects tensors on DEVICE)
-            logs = ppo_update(policy=policy, optimizer=optimizer,
-                              obs_patches=obs_mb,
-                              actions=actions_mb,
-                              logp_old=logp_mb,
-                              returns=returns_mb,
-                              advantages=advs_mb,
-                              clip_ratio=clip_ratio,
-                              value_coef=value_coef,
-                              entropy_coef=entropy_coef,
-                              epochs=1,      # we already handle epoch loop here
-                              batch_size=obs_mb.shape[0])
+            # ===== Call original ppo_update POSITIONALLY to avoid keyword mismatches =====
+            # Note: ppo_update in your repo expects positional args:
+            #   ppo_update(policy, optimizer, obs_patches, actions, logp_old, returns, advantages, clip_ratio, value_coef, entropy_coef)
+            _ = ppo_update(
+                policy, optimizer,
+                obs_mb, actions_mb, logp_mb, returns_mb, advs_mb,
+                clip_ratio, value_coef, entropy_coef
+            )
+
             # free minibatch device tensors right away
             del obs_mb, actions_mb, logp_mb, returns_mb, advs_mb
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     return
+
 
 def main():
     # ensure deterministic-ish startup (free caches)
