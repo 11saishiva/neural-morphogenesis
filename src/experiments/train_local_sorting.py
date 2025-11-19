@@ -14,7 +14,8 @@ import gc
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-
+import matplotlib.pyplot as plt
+from moviepy.editor import ImageSequenceClip
 from src.envs.wrappers import SortingEnv
 from src.agents.ppo import PatchActorCritic, compute_gae, ppo_update
 from src.agents.neuro_fuzzy import NeuroFuzzyActorCritic
@@ -123,6 +124,60 @@ def safe_ppo_update(policy, optimizer,
                 torch.cuda.empty_cache()
 
     return logs
+                        
+# ========= GLOBAL FRAME STORAGE =========
+GLOBAL_FRAMES = []   # stores full grid states across ALL updates (for final MP4)
+
+def capture_frame(env):
+    """
+    Capture the full environment grid as a numpy array (CPU) for video.
+    env.current_state() -> (B, C, H, W)
+    We assume B=1.
+    """
+    with torch.no_grad():
+        frame = env.current_state()[0].detach().cpu().numpy()  # shape (C,H,W)
+        # convert channels to grayscale visualization
+        # convert C,H,W → H,W by summing or taking channel 0
+        frame_img = frame[0]  # channel-0 view (good contrast)
+    return frame_img
+
+def plot_training_curves(reward_list, energy_list, motion_list, out_path="training_metrics.png"):
+    plt.figure(figsize=(12,7))
+    plt.plot(reward_list, label="reward")
+    plt.plot(energy_list, label="energy")
+    plt.plot(motion_list, label="motion_penalty")
+    plt.legend()
+    plt.xlabel("Update")
+    plt.ylabel("Value")
+    plt.title("Training Metrics Over Time")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[viz] Saved training curve → {out_path}")
+
+def make_video_from_frames(frames, out_path="sort_performance.mp4", fps=20):
+    """
+    frames: list of grayscale 2D arrays
+    Converts each frame to uint8 and saves MP4.
+    """
+    if len(frames) == 0:
+        print("[video] No frames captured — skipping video.")
+        return
+
+    # Normalize each frame → uint8
+    norm_frames = []
+    for f in frames:
+        fmin, fmax = f.min(), f.max()
+        if fmax - fmin < 1e-6:
+            img = (f * 0).astype("uint8")
+        else:
+            img = ((f - fmin) / (fmax - fmin) * 255).astype("uint8")
+        norm_frames.append(img)
+
+    clip = ImageSequenceClip(norm_frames, fps=fps)
+    clip.write_videofile(out_path, codec="libx264")
+    print(f"[video] Saved video → {out_path}")
 
 
 def main():
@@ -150,6 +205,10 @@ def main():
 
     iter_start = time.time()
     bench_times = []
+    reward_list = []
+    energy_list = []
+    motion_list = []
+
 
     for update in range(TOTAL_UPDATES):
         # store rollout on CPU lists to avoid holding tensors on GPU
@@ -163,6 +222,9 @@ def main():
         # reset env
         obs = env.reset(B=BATCH, pA=0.5)
         patches, coords = obs  # expected shape: (B, N, C, h, w) or similar depending wrapper
+        # capture initial frame for this update
+        GLOBAL_FRAMES.append(capture_frame(env))
+
 
         # rollout (inference only)
         for t in range(T_STEPS):
@@ -180,6 +242,7 @@ def main():
 
             # step environment (env expects action_grid on DEVICE)
             obs2, reward, info = env.step(action_grid)
+            GLOBAL_FRAMES.append(capture_frame(env))
             patches, coords = obs2
 
             # Immediately move storage copies to CPU and release GPU tensors
@@ -247,6 +310,10 @@ def main():
         # compute motion penalty (move small tensor to device and free quickly)
         act_dev = actions_flat_cpu.view(T, BATCH, N, ACTION_DIM).to(DEVICE)
         mean_mpen = motion_penalty(act_dev.transpose(1, 2)).mean().item()
+        reward_list.append(mean_r)
+        energy_list.append(mean_e)
+        motion_list.append(mean_mpen)
+
         del act_dev
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -271,6 +338,9 @@ def main():
             torch.cuda.synchronize()
         bench_times.append(time.time() - iter_start)
         iter_start = time.time()
+        plot_training_curves(reward_list, energy_list, motion_list)
+        make_video_from_frames(GLOBAL_FRAMES, out_path="sort_performance.mp4")
+
 
     writer.close()
 
