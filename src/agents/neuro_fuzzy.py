@@ -277,257 +277,175 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-# ------------------------------------------------------------
-# Utilities (used by other modules if needed)
-# ------------------------------------------------------------
-def orthogonality_loss(features):
-    # features: (B, F)
-    Fnorm = features - features.mean(0)
-    cov = (Fnorm.T @ Fnorm) / (Fnorm.size(0) - 1)
-    I = torch.eye(cov.size(0), device=cov.device)
-    return ((cov - I)**2).mean()
+# ---------------------------------------------------------------------
+# Helper regularizers
+# ---------------------------------------------------------------------
 
+def orthogonality_loss(fuzzy_feats):
+    # fuzzy_feats : (B, F)
+    if fuzzy_feats.dim() != 2:
+        fuzzy_feats = fuzzy_feats.view(fuzzy_feats.size(0), -1)
+    gram = fuzzy_feats @ fuzzy_feats.t()  # (B,B)
+    I = torch.eye(gram.size(0), device=gram.device)
+    return ((gram - I) ** 2).mean()
 
 def sparsity_loss(rule_masks):
-    # rule_masks: (F, MF) in our design
-    return rule_masks.abs().mean()
+    return torch.mean(torch.abs(rule_masks))
+
+def correlation_loss(fuzzy_feats, metrics):
+    if fuzzy_feats.shape[0] != metrics.shape[0]:
+        min_b = min(fuzzy_feats.shape[0], metrics.shape[0])
+        fuzzy_feats = fuzzy_feats[:min_b]
+        metrics = metrics[:min_b]
+    corr = torch.corrcoef(torch.cat([fuzzy_feats, metrics], dim=1).T)
+    return torch.mean(torch.abs(corr))
 
 
-def correlation_loss(features, metrics):
-    # features: (B,F)
-    # metrics:  (B,K)
-    B, Fdim = features.shape
-    _, Kdim = metrics.shape
-
-    feats = (features - features.mean(0)) / (features.std(0) + 1e-6)
-    mets  = (metrics - metrics.mean(0)) / (metrics.std(0) + 1e-6)
-
-    corr = torch.zeros(Fdim, Kdim, device=features.device)
-    for i in range(Fdim):
-        for j in range(Kdim):
-            corr[i,j] = (feats[:,i] * mets[:,j]).mean()
-    return corr.abs().mean()
-
-
-# ------------------------------------------------------------
-# Neuro-Fuzzy Layer
-# ------------------------------------------------------------
-class FuzzyLayer(nn.Module):
-    def __init__(self, feat_dim=16, mf_per_feat=3, freeze_dims=None):
-        super().__init__()
-        self.feat_dim     = feat_dim
-        self.mf_per_feat  = mf_per_feat
-
-        # membership centers and scales (learnable)
-        self.mf_centers = nn.Parameter(torch.randn(feat_dim, mf_per_feat) * 0.1)
-        self.mf_scales  = nn.Parameter(torch.ones(feat_dim, mf_per_feat) * 0.5)
-
-        # rule masks per-feature (F, MF)
-        self.rule_masks = nn.Parameter(torch.randn(feat_dim, mf_per_feat) * 0.1)
-
-        # consequent vectors per-feature: map fuzzy weight to Δadh, v_x, v_y (F, 3)
-        self.consequents = nn.Parameter(torch.randn(feat_dim, 3) * 0.05)
-
-        # dims to freeze (parameter indices)
-        self.freeze_dims = freeze_dims if freeze_dims is not None else []
-
-    def freeze_selected_dims(self):
-        with torch.no_grad():
-            for d in self.freeze_dims:
-                if 0 <= d < self.feat_dim:
-                    self.mf_centers[d].requires_grad = False
-                    self.mf_scales[d].requires_grad  = False
-                    self.rule_masks[d].requires_grad = False
-                    self.consequents[d].requires_grad = False
-
-    def forward(self, x):
-        """
-        x: (B, F) - raw feature projection coming from encoder
-        returns:
-           f_feat: (B, F) - per-feature aggregated membership score
-           action_raw: (B, 3) - aggregated consequent action
-        """
-        B, Fdim = x.shape
-        x_exp = x.unsqueeze(-1)                                # (B,F,1)
-        centers = self.mf_centers.unsqueeze(0)                  # (1,F,MF)
-        scales  = (self.mf_scales**2).unsqueeze(0) + 1e-6       # (1,F,MF)
-
-        mf = torch.exp(-((x_exp - centers)**2) / (2 * scales)) # (B,F,MF)
-
-        masked = mf * self.rule_masks.unsqueeze(0)              # (B,F,MF)
-        f_feat = masked.sum(-1)                                 # (B,F)
-
-        # produce action vector by weighted consequents
-        action_raw = torch.matmul(f_feat, self.consequents)     # (B,3)
-
-        # freeze important dims (parameter-level)
-        self.freeze_selected_dims()
-
-        return f_feat, action_raw
+# ---------------------------------------------------------------------
+# Metrics extraction from patches for corr_loss / aux head
+# ---------------------------------------------------------------------
+def patches_to_metrics_default(patches):
+    """
+    patches: (B, C, H, W)
+    Returns simple interpretable metrics: (B,4)
+    """
+    B = patches.size(0)
+    m1 = patches.mean(dim=[1, 2, 3])
+    m2 = patches.var(dim=[1, 2, 3])
+    m3 = patches.abs().sum(dim=[1, 2, 3]) / (patches.size(1)*patches.size(2)*patches.size(3))
+    m4 = patches[:, 0].mean(dim=[1, 2])
+    return torch.stack([m1, m2, m3, m4], dim=1)
 
 
-# ------------------------------------------------------------
-# Main Actor–Critic with fuzzy block
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# FINAL VERSION — compatible with your trainer
+# ---------------------------------------------------------------------
 class NeuroFuzzyActorCritic(nn.Module):
     """
-    Backwards-compatible constructor:
-       NeuroFuzzyActorCritic(in_ch=4, patch_size=5, feat_dim=16, action_dim=3, fuzzy_features=..., n_mfs=..., freeze_dims=...)
+    Fully compatible with train_local_sorting.py and ppo_update().
+    Accepts:
+        in_ch
+        patch_size
+        feat_dim
+        fuzzy_features
+        n_mfs
+        n_rules
+        action_dim
     """
-
-    def __init__(self,
-                 in_ch=4,
-                 patch_size=5,
-                 feat_dim=16,
-                 action_dim=3,
-                 fuzzy_features=None,
-                 n_mfs=None,
-                 freeze_dims=[1,3,4,7,11,12,13,14]):
-        # allow backward-compatible param name
-        if fuzzy_features is not None:
-            feat_dim = fuzzy_features
-
+    def __init__(self, in_ch=4, patch_size=5,
+                 feat_dim=48, fuzzy_features=12,
+                 n_mfs=3, n_rules=24,
+                 action_dim=3):
         super().__init__()
-        mf_per_feat = n_mfs if n_mfs is not None else 3
 
-        # local names
-        C = in_ch
-        S = patch_size
-        Fdim = feat_dim
-        A = action_dim
+        self.in_ch = in_ch
+        self.patch_size = patch_size
+        self.feat_dim = feat_dim
+        self.fuzzy_features = fuzzy_features
+        self.n_mfs = n_mfs
+        self.n_rules = n_rules
+        self.action_dim = action_dim
 
-        # CNN encoder
+        # ------------------------------
+        # Encoder: small CNN
+        # ------------------------------
         self.encoder_conv = nn.Sequential(
-            nn.Conv2d(C, 32, 3, padding=1),
+            nn.Conv2d(in_ch, 32, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 32, 3, padding=1),
             nn.ReLU(),
-        )
-        self.flatten = nn.Linear(32 * S * S, Fdim)
-
-        # fuzzy layer
-        self.fuzzy = FuzzyLayer(feat_dim=Fdim, mf_per_feat=mf_per_feat, freeze_dims=freeze_dims)
-
-        # actor MLP → mean action (includes concatenated fuzzy action)
-        self.actor = nn.Sequential(
-            nn.Linear(Fdim + A, 64),
-            nn.ReLU(),
-            nn.Linear(64, A)
+            nn.Flatten(),
         )
 
-        # critic MLP
-        self.critic = nn.Sequential(
-            nn.Linear(Fdim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+        flat_dim = 32 * patch_size * patch_size
+        self.encoder_fc = nn.Linear(flat_dim, feat_dim)
+
+        # ------------------------------
+        # Fuzzy memberships per feature
+        # ------------------------------
+        self.mf_centers = nn.Parameter(torch.randn(fuzzy_features, n_mfs))
+        self.mf_scales = nn.Parameter(torch.ones(fuzzy_features, n_mfs))
+
+        # ------------------------------
+        # Rule mask matrix
+        # ------------------------------
+        self.rule_masks = nn.Parameter(
+            torch.randn(n_rules, fuzzy_features)
         )
 
-        # auxiliary disentanglement head (predict interpretable metrics)
-        self.aux_head = nn.Sequential(
-            nn.Linear(Fdim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 4)  # adhesion, A_frac, B_frac, crowd
-        )
+        # ------------------------------
+        # Heads
+        # ------------------------------
+        self.actor_head = nn.Linear(n_rules, action_dim)
+        self.value_head = nn.Linear(n_rules, 1)
 
-        # action log-std parameter for stochastic policy - conservative init
-        self.logstd = nn.Parameter(torch.ones(A) * -2.0)  # std ~= exp(-2) ~ 0.135
+        # aux head predicts metrics (4-dim)
+        self.aux_head = nn.Linear(n_rules, 4)
 
-        self.feat_dim = Fdim
-        self.action_dim = A
-        self.patch_size = S
-        self.in_ch = C
+        # log std for Gaussian policy
+        self.logstd = nn.Parameter(torch.zeros(action_dim))
 
-    # -------------------------
-    def patches_to_metrics(self, patches):
-        # patches: (B,4,h,w)
-        A = patches[:,0].reshape(patches.size(0), -1).mean(1)
-        B = patches[:,1].reshape(patches.size(0), -1).mean(1)
-        adh = patches[:,2].reshape(patches.size(0), -1).mean(1)
-        crowd = A + B
-        return torch.stack([adh, A, B, crowd], dim=1)
+        # metric extractor
+        self.patches_to_metrics = patches_to_metrics_default
 
-    # -------------------------
+    # ------------------------------------------------------------------
+    # Encoding
+    # ------------------------------------------------------------------
     def encode(self, patches):
         h = self.encoder_conv(patches)
-        h = h.reshape(h.size(0), -1)
-        f = self.flatten(h)
-        return f
+        return self.encoder_fc(h)
 
-    # -------------------------
-    def forward(self, patches):
+    # ------------------------------------------------------------------
+    # Fuzzy forward pass
+    # ------------------------------------------------------------------
+    def fuzzy_forward(self, feats):
         """
-        Standard forward used by training and inference.
+        feats : (B, feat_dim)
         Returns:
-           mu: (B, A) action mean (bounded)
-           value: (B,1)
-           fuzzy_feats: (B, F)
+            fuzzy_rule_output: (B, n_rules)
+            fuzzy_features:    (B, fuzzy_features)
         """
-        f = self.encode(patches)                    # (B, Fdim)
-        fuzzy_feats, fuzzy_actions = self.fuzzy(f)  # (B, F), (B, 3)
+        # reduce to fuzzy_features (linear projection)
+        f = feats[:, :self.fuzzy_features]
 
-        # combine encoding and fuzzy suggested action
-        actor_input = torch.cat([f, fuzzy_actions], dim=1)
-        raw_mu = self.actor(actor_input)  # unbounded output
+        # compute membership values
+        # f: (B,F) -> expand to (B,F,n_mfs)
+        f_exp = f.unsqueeze(-1)
+        centers = self.mf_centers.unsqueeze(0)
+        scales = F.softplus(self.mf_scales).unsqueeze(0)
 
-        # --- BOUND ACTIONS SAFELY ---
-        # Δadh in [-0.1, 0.1], vx, vy in [-vmax, vmax]
-        vmax = 1.0  # conservative pixel-per-step cap
-        scale = torch.tensor([0.1, vmax, vmax], device=raw_mu.device).unsqueeze(0)
-        mu = torch.tanh(raw_mu) * scale
+        mvals = torch.exp(-((f_exp - centers) ** 2) / (2 * scales ** 2))  # (B,F,n_mfs)
+        mvals = mvals.mean(dim=-1)                                        # (B,F)
 
-        value = self.critic(f)
+        # rule activation
+        rule_act = torch.matmul(mvals, self.rule_masks.t())               # (B, n_rules)
+        rule_act = torch.relu(rule_act)
+
+        return rule_act, mvals
+
+    # ------------------------------------------------------------------
+    # Main forward
+    # ------------------------------------------------------------------
+    def forward(self, patches):
+        feats = self.encode(patches)
+        rule_out, fuzzy_feats = self.fuzzy_forward(feats)
+
+        mu = self.actor_head(rule_out)
+        value = self.value_head(rule_out)
         return mu, value, fuzzy_feats
 
-    # -------------------------
-    def act(self, patches, deterministic=False):
-        mu, _, _ = self.forward(patches)
-        std = self.logstd.exp().unsqueeze(0)
-        dist = Normal(mu, std)
-        if deterministic:
-            return mu
-        return dist.rsample()
-
-    # -------------------------
+    # ------------------------------------------------------------------
+    # get action & value
+    # ------------------------------------------------------------------
     def get_action_and_value(self, patches, deterministic=False):
-        """
-        Returns:
-           action: (B, A)
-           logprob: (B,)
-           value: (B,1)
-           mu: (B,A)
-           logstd: parameter
-        """
         mu, value, fuzzy_feats = self.forward(patches)
-        std = self.logstd.exp().unsqueeze(0)
+        std = self.logstd.exp().unsqueeze(0).expand_as(mu)
         dist = Normal(mu, std)
+
         if deterministic:
             action = mu
         else:
             action = dist.rsample()
-        logprob = dist.log_prob(action).sum(dim=-1)
-        return action, logprob, value, mu, self.logstd
 
-    # -------------------------
-    def get_fuzzy_activations(self, patches):
-        with torch.no_grad():
-            f = self.encode(patches)
-        return f
-
-    # -------------------------
-    def get_rule_info(self):
-        """
-        Create shallow 'rule' representation for interpretation utilities.
-        """
-        F = self.fuzzy.feat_dim
-        MF = self.fuzzy.mf_per_feat
-        device = self.fuzzy.rule_masks.device
-
-        masks = torch.zeros((F, F, MF), device=device)
-        center_masks = F.softmax(self.fuzzy.rule_masks, dim=-1).detach()  # (F, MF)
-        for r in range(F):
-            masks[r, r, :] = center_masks[r, :]
-
-        consequents = self.fuzzy.consequents.detach().clone()
-        scales = torch.ones(F, device=device)
-
-        return masks.cpu(), consequents.cpu(), scales.cpu()
+        logp = dist.log_prob(action).sum(-1)
+        return action, logp, value, mu, std
