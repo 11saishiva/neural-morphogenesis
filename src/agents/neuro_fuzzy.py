@@ -348,7 +348,7 @@ class NeuroFuzzyActorCritic(nn.Module):
         # make std match mu shape for broadcasting
         std = self.logstd.exp().unsqueeze(0).expand_as(mu)
         # clamp std for numerical stability
-        std = torch.clamp(std, min=1e-3, max=10.0)
+        std = torch.clamp(std, min=1e-3, max=0.3)
         dist = Normal(mu, std)
 
         if deterministic:
