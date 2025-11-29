@@ -287,11 +287,7 @@ class NeuroFuzzyActorCritic(nn.Module):
 
         # aux head predicts metrics (4-dim)
         self.aux_head = nn.Linear(n_rules, 4)
-
-        # log std for Gaussian policy (clamp in forward uses)
-        self.logstd = nn.Parameter(torch.zeros(action_dim))
-
-        # metric extractor
+        self.logstd = nn.Parameter(torch.ones(action_dim) * 0.6)
         self.patches_to_metrics = patches_to_metrics_default
 
     # ------------------------------------------------------------------
