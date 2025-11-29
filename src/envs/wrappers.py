@@ -13,7 +13,7 @@ class SortingEnv:
       - 'local': returns per-cell patches (B,N,4,5,5) + coords
     """
 
-    def __init__(self, H=64, W=64, device='cpu', gamma_motion=0.01,
+    def __init__(self, H=64, W=64, device='cpu', gamma_motion=0.1,
                  steps_per_action=1, obs_mode='local'):
         self.H, self.W = H, W
         self.device = torch.device(device)
