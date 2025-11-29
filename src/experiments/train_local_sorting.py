@@ -479,7 +479,22 @@ def safe_ppo_update(policy, optimizer,
     S = int(obs_cpu.shape[0])
     if S == 0:
         return {}
-    logs = {}
+                # call ppo_update using the expected keyword names of the final implementation
+    logs = ppo_update(
+                policy=policy,
+                optimizer=optimizer,
+                obs_patches=obs_mb,
+                actions=acts_mb,
+                logp_old=logp_mb,
+                returns=ret_mb,
+                advantages=adv_mb,
+                clip_ratio=clip_eps,
+                value_coef=vf_coef,
+                entropy_coef=ent_coef,
+                epochs=1,
+                batch_size=obs_mb.shape[0],
+            )
+
     for epoch in range(epochs):
         perm = torch.randperm(S)
         for start in range(0, S, batch_size):
