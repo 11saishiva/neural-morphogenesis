@@ -357,4 +357,5 @@ class NeuroFuzzyActorCritic(nn.Module):
             action = dist.rsample()
 
         logp = dist.log_prob(action).sum(-1)
+        action = torch.tanh(action)
         return action, logp, value, mu, std
