@@ -198,6 +198,8 @@ def ppo_update(
     # Move everything to the correct device
     obs_patches = obs_patches.to(device)
     actions = actions.to(device)
+    actions = torch.tanh(actions)
+
     logp_old = logp_old.to(device)
     returns = returns.to(device)
     advantages = advantages.to(device)
