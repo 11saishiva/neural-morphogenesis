@@ -684,9 +684,9 @@ def make_video_from_frames(frames, out_path="visuals/sort_performance.mp4", fps=
 # ---------------- main training loop ----------------
 def main():
     if update < 20:
-    print("SANITY: rewards", rewards.min().item(), rewards.max().item(), "values", values.min().item(), values.max().item())
-    a_mean, a_std = advantages.mean().item(), advantages.std().item()
-    print("SANITY: adv mean/std", a_mean, a_std)
+        print("SANITY: rewards", rewards.min().item(), rewards.max().item(), "values", values.min().item(), values.max().item())
+        a_mean, a_std = advantages.mean().item(), advantages.std().item()
+        print("SANITY: adv mean/std", a_mean, a_std)
 
     gc.collect()
     if torch.cuda.is_available():
