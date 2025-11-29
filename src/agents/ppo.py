@@ -203,6 +203,11 @@ def ppo_update(
     logp_old = logp_old.to(device)
     returns = returns.to(device)
     advantages = advantages.to(device)
+        # --- normalize advantages (important!) ---
+    adv_mean = advantages.mean()
+    adv_std = advantages.std(unbiased=False) + 1e-8
+    advantages = (advantages - adv_mean) / adv_std
+
 
     N = obs_patches.shape[0]
     batch_size = batch_size if batch_size is not None else N
