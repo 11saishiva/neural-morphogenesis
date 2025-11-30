@@ -257,11 +257,12 @@ class NeuroFuzzyActorCritic(nn.Module):
         # ------------------------------
         self.encoder_conv = nn.Sequential(
             nn.Conv2d(in_ch, 32, 3, padding=1),
-            nn.ReLU(),
+            nn.ReLU(inplace=False),
             nn.Conv2d(32, 32, 3, padding=1),
-            nn.ReLU(),
+            nn.ReLU(inplace=False),
             nn.Flatten(),
         )
+
 
         flat_dim = 32 * patch_size * patch_size
         self.encoder_fc = nn.Linear(flat_dim, feat_dim)
@@ -294,6 +295,7 @@ class NeuroFuzzyActorCritic(nn.Module):
     # Encoding
     # ------------------------------------------------------------------
     def encode(self, patches):
+        patches = patches.contiguous()
         h = self.encoder_conv(patches)
         return self.encoder_fc(h)
 
