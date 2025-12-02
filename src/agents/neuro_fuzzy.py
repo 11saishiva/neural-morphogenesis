@@ -178,21 +178,6 @@
 #         return action, logp, value, mu, std
 
 # src/agents/neuro_fuzzy.py
-"""
-Neuro-fuzzy actor-critic (safe, simple, and compatible with the trainer)
-
-# src/agents/neuro_fuzzy.py
-"""
-Neuro-fuzzy actor-critic (backwards-compatible with trainer expecting `policy.logstd`)
-
-This version:
- - Provides `self.logstd` as an nn.Parameter (so older ppo code works).
- - Also provides a stable std for sampling via softplus(self.raw_logstd).
- - Avoids in-place ops and non-contiguous shortcuts that break autograd.
- - API:
-     policy(patches) -> (mu, value, fuzzy_feats)
-     policy.get_action_and_value(patches, deterministic=False) -> action, logp, value, mu, std
-"""
 
 from typing import Callable, Tuple
 import math
