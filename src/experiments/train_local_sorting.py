@@ -23,15 +23,15 @@ W = 32
 PATCH_SIZE = 5
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 16 #T_STEPS = 8
+T_STEPS = 32 #T_STEPS = 8
 TOTAL_UPDATES = 200        # <<< CHANGE HERE
 
 GAMMA = 0.005 #GAMMA = 0.99
 LAM = 0.95
-EPOCHS = 2 #EPOCHS = 3
-MINI_BATCH = 1024 #MINI_BATCH = 256
-LR = 1e-4 #LR = 3e-4
-CLIP = 0.2
+EPOCHS = 1 #EPOCHS = 3
+MINI_BATCH = 2048 #MINI_BATCH = 256
+LR = 5e-5 #LR = 3e-4
+CLIP = 0.1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
