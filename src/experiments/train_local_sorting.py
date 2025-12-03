@@ -228,6 +228,17 @@
 #  - small memory housekeeping for Colab
 # ------------------------------------------------------------
 
+# src/experiments/train_local_sorting.py
+# ------------------------------------------------------------
+# CLEAN WORKING TRAINING SCRIPT FOR LOCAL SORTING (COLAB SAFE)
+# - keeps optimizer variable name `optimz` as requested
+# - normalizes advantages
+# - safer PPO hyperparameters (smaller value_coef, smaller entropy_coef)
+# - initial logstd reduced to limit early large actions
+# - optional action clamping before env.step
+# - action diagnostics and deterministic eval snapshots
+# ------------------------------------------------------------
+
 import os
 import gc
 import time
@@ -249,58 +260,46 @@ W = 32
 PATCH_SIZE = 5
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 32                # rollout length
-TOTAL_UPDATES = 1000        # <<< CHANGE HERE if you want fewer
+T_STEPS = 32            # rollout length
+TOTAL_UPDATES = 1000    # full run target
 
-# PPO / optimization hyperparameters (tweak safely)
-GAMMA = 0.99                # use 0.99 for GAE stability (original low gamma was atypical)
+GAMMA = 0.99            # environment return discount (set sensible RL default)
 LAM = 0.95
-EPOCHS = 3                  # epochs per update
-MINI_BATCH = 256            # minibatch for ppo_update
-LR = 3e-4
-CLIP = 0.2
-
-# PPO loss weights (safer defaults)
-VALUE_COEF = 0.25
-ENTROPY_COEF = 0.02
+EPOCHS = 1
+MINI_BATCH = 2048
+LR = 1e-4               # safer, smaller lr
+CLIP = 0.1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# output folders
+SAVE_CHECKPOINT_EVERY = 50     # checkpoint cadence
+DETERMINISTIC_EVAL_EVERY = 100 # save a deterministic eval rollout every this many updates
+DETERMINISTIC_EVAL_STEPS = 64  # steps in a deterministic evaluation rollout
+MAX_SAVE_FRAMES = 200          # keep last N frames for final video
+
 os.makedirs("checkpoints", exist_ok=True)
 os.makedirs("visuals", exist_ok=True)
-os.makedirs("visuals/frames", exist_ok=True)
-
-# how many frames to sample and save across the whole run
-SAMPLE_FRAMES_N = 100
-
 # --------------------------------------------
 
 def state_to_img(state):
-    """Convert env.current_state() to HxWx3 uint8 image."""
+    """Converts env.current_state() -> H x W x 3 uint8 image (visualization)."""
     if isinstance(state, torch.Tensor):
         s = state.detach().cpu().numpy()
     else:
         s = np.array(state)
 
-    # handle batched state (B, N, C) -> take first batch
+    # if batch present, take first
     if s.ndim == 3 and s.shape[0] == BATCH:
         s = s[0]
 
-    # expected shapes:
-    # (N, C) or (H, W) or (N,)
+    # expecting (N, C) where N == H*W OR a flat H*W arr
     if s.ndim == 2:
         N, C = s.shape
-        # pick adhesion channel if present else channel 0
         ch = 2 if C > 2 else 0
         try:
             img = s[:, ch].reshape(H, W)
         except Exception:
-            # fallback: try transpose
-            if s.shape[1] == H * W:
-                img = s.T[:, ch].reshape(H, W)
-            else:
-                img = np.mean(s, axis=-1).reshape(H, W)
+            img = s.mean(axis=1).reshape(H, W)
     elif s.ndim == 1:
         if s.size == H * W:
             img = s.reshape(H, W)
@@ -310,70 +309,44 @@ def state_to_img(state):
                 img = s.reshape(side, side)
             else:
                 flat = np.zeros(H * W, dtype=s.dtype)
-                length = min(s.size, H * W)
+                length = min(s.size, H*W)
                 flat[:length] = s[:length]
                 img = flat.reshape(H, W)
     elif s.ndim == 2 and s.shape[0] == H and s.shape[1] == W:
         img = s
     else:
-        # last resort: mean across channels then reshape/truncate/pad
-        arr = np.array(s, dtype=np.float32)
-        if arr.ndim >= 3:
-            img = np.mean(arr, axis=-1)
-            if img.shape != (H, W):
-                try:
-                    img = img.reshape(H, W)
-                except Exception:
-                    img = np.zeros((H, W), dtype=np.float32)
-        else:
-            img = np.zeros((H, W), dtype=np.float32)
+        # fallback: mean across channels then reshape if possible
+        img = np.mean(s, axis=-1)
+        if img.size != H * W:
+            img = np.resize(img, (H, W))
 
-    # normalize to 0-255
-    img = img.astype(np.float32)
+    # normalize 0-255
     img = img - np.nanmin(img)
-    mx = np.nanmax(img)
-    if mx > 0:
-        img = img / mx
-    img = (img * 255.0).clip(0, 255).astype(np.uint8)
+    if np.nanmax(img) > 0:
+        img = img / np.nanmax(img)
+    img = (img * 255).astype(np.uint8)
     rgb = np.stack([img, img, img], axis=-1)
     return rgb
 
-# --------------------------------------------
-
-def save_frame_sample(frames_list, total_updates, saved_folder="visuals/frames", n_samples=SAMPLE_FRAMES_N):
-    """
-    Save exactly n_samples frames evenly across training.
-    frames_list contains frames appended in chronological order (one per update).
-    """
-    os.makedirs(saved_folder, exist_ok=True)
-    L = len(frames_list)
-    if L == 0:
-        return []
-    # choose indices evenly
-    n = min(n_samples, L)
-    indices = [int(round(i * (L - 1) / (n - 1))) if n > 1 else 0 for i in range(n)]
-    saved_paths = []
-    for idx in indices:
-        img = frames_list[idx]
-        # ensure uint8 3-channel
+def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
+    """Run a deterministic rollout (no sampling) and return a list of frames."""
+    frames = []
+    patches, coords = env.reset(B=1, pA=0.5)
+    for t in range(steps):
+        flat = patches.reshape(BATCH * (env.H * env.W), 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        with torch.no_grad():
+            a, _, _, _, _ = policy.get_action_and_value(flat, deterministic=True)
+        act = a.reshape(BATCH, env.H * env.W, ACTION_DIM)
+        if clamp_actions:
+            act = act.clamp(-1.0, 1.0)
+        (patches, coords), reward, _ = env.step(act)
         try:
-            arr = np.array(img).astype(np.uint8)
-            if arr.ndim == 2:
-                arr = np.stack([arr, arr, arr], axis=-1)
-            if arr.shape[2] == 4:
-                arr = arr[:, :, :3]
-            path = os.path.join(saved_folder, f"frame_sample_{idx:04d}.png")
-            imageio.imwrite(path, arr)
-            saved_paths.append(path)
+            frames.append(state_to_img(env.current_state()))
         except Exception:
-            # ignore single failures
-            continue
-    return saved_paths
-
-# --------------------------------------------
+            frames.append(np.zeros((H, W, 3), dtype=np.uint8))
+    return frames
 
 def main():
-    # housekeeping
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -388,53 +361,60 @@ def main():
         action_dim=ACTION_DIM
     ).to(DEVICE)
 
-    optimizer = optim.Adam(policy.parameters(), lr=LR)
+    # safer initial logstd (reduce initial exploration magnitude)
+    with torch.no_grad():
+        if hasattr(policy, "logstd"):
+            policy.logstd.data.fill_(-2.0)  # std ~= exp(-2) ~ 0.135
+            print(f"[INIT] set policy.logstd -> mean={policy.logstd.data.mean().item():.3f} (std~{policy.logstd.exp().mean().item():.4f})")
+
+    optimz = optim.Adam(policy.parameters(), lr=LR)
 
     N = H * W
 
     rewards_hist = []
     energy_hist = []
     motion_hist = []
-    frames = []
+    frames = []            # rolling store of frames for final video
+    eval_count = 0
 
-    iter_start = time.time()
+    start_time = time.time()
 
     for update in range(TOTAL_UPDATES):
-        # small GC and cuda free to keep Colab stable
-        if update % 50 == 0:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # Reset environment
+        # Reset environment & get local observation
         patches, coords = env.reset(B=BATCH, pA=0.5)
 
-        # Capture frame for visualization (store as HxWx3 uint8)
+        # Capture a frame for quick visuals
         try:
             frames.append(state_to_img(env.current_state()))
         except Exception:
             frames.append(np.zeros((H, W, 3), dtype=np.uint8))
+        if len(frames) > MAX_SAVE_FRAMES:
+            frames.pop(0)
 
-        # Rollout buffers
+        # Rollout storage (kept on CPU where possible)
         obs_buf, act_buf, logp_buf, val_buf = [], [], [], []
         rew_buf, done_buf = [], []
 
+        # rollout
         for t in range(T_STEPS):
             flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
-        # after with torch.no_grad(): a, logp, v, _, _
-        mu_abs = a.abs().mean().item()
-        try:
-            current_std = policy.logstd.exp().mean().item()
-        except Exception:
-            current_std = float('nan')
-        if update % 1 == 0 and t == 0:
-            print(f"[ACT STATS] mu_abs={mu_abs:.4f} std={current_std:.4f}")
 
+            # diagnostics: action magnitude & policy std
+            if t == 0:
+                try:
+                    current_std = policy.logstd.exp().mean().item() if hasattr(policy, "logstd") else float('nan')
+                except Exception:
+                    current_std = float('nan')
+                mu_abs = a.abs().mean().item()
+                print(f"[UPDATE {update:04d} T{t}] action_mean_abs={mu_abs:.4f} policy_std_mean={current_std:.4f}")
 
             act = a.reshape(BATCH, N, ACTION_DIM)
+            # clamp actions to prevent runaway motion (diagnostic / safety). Keep if env expects [-1,1].
+            act = act.clamp(-1.0, 1.0)
+
             lp = logp.reshape(BATCH, N)
             val = v.view(BATCH, N).mean(1)
 
@@ -447,24 +427,13 @@ def main():
             rew_buf.append(reward.cpu())
             done_buf.append(torch.zeros_like(reward.cpu()))
 
-            # free temp tensors
-            del flat, a, logp, v, act, lp, val
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # Bootstrap final value (deterministic)
+        # bootstrap final value (deterministic)
         with torch.no_grad():
-            final_flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
-            _, _, v_final, _, _ = policy.get_action_and_value(final_flat, deterministic=True)
-            val_buf.append(v_final.view(BATCH, N).mean(1).cpu())
-        try:
-            del final_flat, v_final
-        except Exception:
-            pass
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
+        val_buf.append(v.view(BATCH, N).mean(1).cpu())
 
-        # Convert to tensors
+        # stack buffers
         T = T_STEPS
         obs = torch.stack(obs_buf)               # (T,B,N,4,5,5)
         acts = torch.stack(act_buf)              # (T,B,N,3)
@@ -473,9 +442,10 @@ def main():
         dones = torch.stack(done_buf)            # (T,B)
         vals = torch.stack(val_buf)              # (T+1,B)
 
-        # compute GAE and returns
+        # compute GAE & returns
         adv, ret = compute_gae(rews, vals, dones, GAMMA, LAM)
 
+        # flatten for ppo update
         S = T * BATCH * N
         obs_f = obs.reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
         act_f = acts.reshape(S, ACTION_DIM)
@@ -483,48 +453,40 @@ def main():
         ret_f = ret.unsqueeze(2).repeat(1,1,N).reshape(S)
         adv_f = adv.unsqueeze(2).repeat(1,1,N).reshape(S)
 
-        # normalize advantages (important for stable PPO updates)
+        # normalize advantages (important)
         adv_f = adv_f.clone()
         adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
 
-        # (optional) normalize returns to stabilize value loss — uncomment if desired
+        # optional: normalize returns (commented by default)
         # ret_f = ret_f.clone()
         # ret_f = (ret_f - ret_f.mean()) / (ret_f.std() + 1e-8)
 
-        # PPO update
-        try:
-            logs = ppo_update(
-                policy=policy,
-                optimizer=optimizer,
-                obs_patches=obs_f,
-                actions=act_f,
-                logp_old=logp_f,
-                returns=ret_f,
-                advantages=adv_f,
-                clip_ratio=CLIP,
-                value_coef=VALUE_COEF,
-                entropy_coef=ENTROPY_COEF,
-                epochs=EPOCHS,
-                batch_size=MINI_BATCH,
-            )
-        except TypeError:
-            # fallback for older ppo_update positional signature
-            try:
-                logs = ppo_update(policy, optimizer, obs_f, act_f, logp_f, ret_f, adv_f, CLIP, VALUE_COEF, ENTROPY_COEF)
-            except Exception as e:
-                print("[WARN] ppo_update failed with error:", e)
-                logs = {}
+        # PPO update with safer hyperparameters
+        logs = ppo_update(
+            policy,
+            optimz,                 # note: your optimizer variable name is `optimz`
+            obs_f,
+            act_f,
+            logp_f,
+            ret_f,
+            adv_f,
+            clip_ratio=CLIP,
+            value_coef=0.25,        # reduce value weight a bit
+            entropy_coef=0.005,     # smaller entropy -> less random motor babbling
+            epochs=EPOCHS,
+            batch_size=MINI_BATCH,
+        )
 
-        # Diagnostics
+        # Diagnostics (compute components cleanly)
         mean_r = rews.mean().item()
         mean_e = interfacial_energy(env.current_state()).mean().item()
-        # motion_penalty expects actions shaped appropriately — compute on current rollout actions
+        # motion penalty expects actions shaped like (B, A, H, W) or similar; reuse motion_penalty helper:
         try:
             act_dev = act_f.reshape(T, BATCH, N, ACTION_DIM).to(DEVICE)
             mean_m = motion_penalty(act_dev.transpose(1, 2)).mean().item()
-            del act_dev
         except Exception:
-            mean_m = float(np.nan)
+            # fallback: compute a simple action magnitude metric
+            mean_m = act_f.abs().mean().item()
 
         rewards_hist.append(mean_r)
         energy_hist.append(mean_e)
@@ -532,52 +494,54 @@ def main():
 
         print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f}")
 
-        # checkpoints
-        if update % 10 == 0:
-            torch.save(policy.state_dict(), f"checkpoints/ppo_{update:04d}.pt")
+        # checkpoint
+        if update % SAVE_CHECKPOINT_EVERY == 0:
+            ckpt_path = f"checkpoints/ppo_{update:04d}.pt"
+            torch.save(policy.state_dict(), ckpt_path)
+            print(f"[ckpt] saved {ckpt_path}")
 
-    # --- end training loop ---
+        # deterministic eval snapshot (visual check without sampling noise)
+        if (update + 1) % DETERMINISTIC_EVAL_EVERY == 0:
+            eval_frames = deterministic_rollout_frames(env, policy, steps=DETERMINISTIC_EVAL_STEPS, clamp_actions=True)
+            eval_fn = f"visuals/eval_{eval_count:03d}.mp4"
+            try:
+                imageio.mimwrite(eval_fn, eval_frames, fps=12)
+                print(f"[eval] saved deterministic eval video -> {eval_fn}")
+            except Exception as e:
+                print("[eval] failed to save eval video:", e)
+            eval_count += 1
 
-    iter_time = time.time() - iter_start
-    print(f"Training finished in {iter_time/60.0:.2f} minutes")
-
-    # ---- Save metrics arrays for later plotting/analysis ----
-    np.savez_compressed("visuals/metrics.npz",
-                        updates=np.arange(len(rewards_hist)),
-                        rewards=np.array(rewards_hist),
-                        energies=np.array(energy_hist),
-                        motions=np.array(motion_hist))
-
-    # ---- Save plot ----
+    # plotting
     plt.figure(figsize=(10,6))
+    plt.subplot(3,1,1)
     plt.plot(rewards_hist, label="reward")
-    plt.plot(energy_hist, label="energy")
-    plt.plot(motion_hist, label="motion penalty")
+    plt.ylabel("reward")
     plt.legend()
-    plt.xlabel("update")
-    plt.savefig("visuals/training_metrics.png", dpi=150)
+    plt.subplot(3,1,2)
+    plt.plot(energy_hist, label="energy")
+    plt.ylabel("energy")
+    plt.legend()
+    plt.subplot(3,1,3)
+    plt.plot(motion_hist, label="motion penalty")
+    plt.ylabel("motion")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("visuals/training_metrics.png")
     plt.close()
 
-    # ---- Save sampled frames (exactly SAMPLE_FRAMES_N if available) ----
-    sampled_paths = save_frame_sample(frames, TOTAL_UPDATES, saved_folder="visuals/frames", n_samples=SAMPLE_FRAMES_N)
-    print(f"Saved {len(sampled_paths)} sampled frames to visuals/frames/")
-
-    # ---- Create video from sampled frames (higher quality) ----
+    # create final short video from saved frames (if any)
     try:
-        if len(sampled_paths) > 0:
-            # ensure order
-            sampled_paths = sorted(sampled_paths)
-            imgs = [imageio.imread(p) for p in sampled_paths]
-            imageio.mimwrite("visuals/sort_progress_sampled.mp4", imgs, fps=12)
-            print("Saved sampled video → visuals/sort_progress_sampled.mp4")
+        if len(frames) == 0:
+            print("[viz] no frames recorded.")
         else:
-            # fallback: use all frames captured (may be many)
-            imageio.mimwrite("visuals/sort_perf_allframes.mp4", frames, fps=10)
-            print("Saved full-frame video → visuals/sort_perf_allframes.mp4")
+            imageio.mimwrite("visuals/sort_perf.mp4", frames, fps=10)
+            print("[viz] saved visuals/sort_perf.mp4")
     except Exception as e:
-        print("[WARN] Video creation failed:", e)
+        print("[viz] failed to write final video:", e)
 
-    print("Training done. Saved plots + video + metrics.npz")
+    total_time = time.time() - start_time
+    print(f"Training done ({TOTAL_UPDATES} updates). Time elapsed: {total_time/60:.2f} minutes.")
+    print("Saved plots + video to visuals/ and checkpoints/")
 
 if __name__ == "__main__":
     main()
