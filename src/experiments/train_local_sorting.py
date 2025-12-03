@@ -424,6 +424,15 @@ def main():
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
+        # after with torch.no_grad(): a, logp, v, _, _
+        mu_abs = a.abs().mean().item()
+        try:
+            current_std = policy.logstd.exp().mean().item()
+        except Exception:
+            current_std = float('nan')
+        if update % 1 == 0 and t == 0:
+            print(f"[ACT STATS] mu_abs={mu_abs:.4f} std={current_std:.4f}")
+
 
             act = a.reshape(BATCH, N, ACTION_DIM)
             lp = logp.reshape(BATCH, N)
