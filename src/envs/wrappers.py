@@ -38,20 +38,23 @@
 #         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
 #         morphogen = self._make_morphogen(B)
 #         center = torch.ones(B, 1, self.H, self.W, device=self.device)
-#         self.state = torch.cat([types, adhesion, morphogen, center], dim=1)
+#         # build state and immediately detach/clone to prevent autograd tracking
+#         state = torch.cat([types, adhesion, morphogen, center], dim=1)
+#         self.state = state.detach().clone()
 #         return self.get_observation()
 
 #     # ----- observation retrieval -----
 #     def get_observation(self):
 #         """
 #         Depending on mode:
-#           - global: returns full grid state
-#           - local: returns (patches, coords)
+#           - global: returns full grid state (detached clone)
+#           - local: returns (patches, coords) computed from detached clone
 #         """
 #         if self.obs_mode == 'global':
-#             return self.state.clone()
+#             return self.state.detach().clone()
 #         elif self.obs_mode == 'local':
-#             patches, coords = extract_local_patches(self.state, patch_size=5)
+#             # call extract_local_patches on a detached clone to be safe
+#             patches, coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
 #             return patches, coords
 #         else:
 #             raise ValueError("obs_mode must be 'global' or 'local'")
@@ -62,36 +65,49 @@
 #         actions:
 #           - if global mode: tensor (B,3,H,W)
 #           - if local mode: per-cell actions (B,N,3) that will be reshaped to grid
+#         Returns:
+#           observation, reward (detached), info (cpu tensors)
 #         """
+#         # defensive checks
+#         if self.state is None:
+#             raise RuntimeError("Environment not reset. Call reset() before step().")
+
 #         B = self.state.shape[0]
 
 #         if self.obs_mode == 'local':
 #             # reshape per-cell actions to grid (B,3,H,W)
 #             N = self.H * self.W
-#             assert actions.shape[1] == N
+#             assert actions.shape[1] == N, f"expected actions second dim {N}, got {actions.shape[1]}"
+#             # actions expected (B, N, A) -> transpose to (B, A, H, W)
 #             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
-#         s = self.state
-#         for _ in range(self.steps_per_action):
-#             s = self.dca(s, actions, steps=1)
-#         self.state = s
+#         # Run environment dynamics under no_grad so env ops don't create graph
+#         with torch.no_grad():
+#             s = self.state
+#             for _ in range(self.steps_per_action):
+#                 # dca may modify or return new tensor; keep return and then detach/clone
+#                 s = self.dca(s, actions, steps=1)
+#             # ensure any underlying storage is detached and independent
+#             self.state = s.detach().clone()
 
-#         e = interfacial_energy(self.state)
-#         mpen = motion_penalty(actions)
-#         reward = -e - self.gamma_motion * mpen
-#         info = {
-#             "interfacial_energy": e.detach().cpu(),
-#             "motion_penalty": mpen.detach().cpu()
-#         }
+#             # compute metrics using detached tensors
+#             e = interfacial_energy(self.state).detach()
+#             mpen = motion_penalty(actions.detach()).detach()
+
+#             reward = -(e + self.gamma_motion * mpen)
+#             # info should be CPU tensors for logging
+#             info = {
+#                 "interfacial_energy": e.cpu(),
+#                 "motion_penalty": mpen.cpu()
+#             }
+
+#         # return safe (detached) observation and reward
 #         return self.get_observation(), reward.detach(), info
-#         # ----- utility -----
+
+#     # ----- utility -----
 #     def current_state(self):
 #         """Return a detached copy of the full grid state (B,5,H,W)."""
-#         return self.state.clone().detach()
-
-
-#         return self.state.clone()
-
+#         return self.state.detach().clone()
 
 # src/envs/wrappers.py
 import torch
@@ -133,26 +149,43 @@ class SortingEnv:
         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
         morphogen = self._make_morphogen(B)
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
-        # build state and immediately detach/clone to prevent autograd tracking
-        state = torch.cat([types, adhesion, morphogen, center], dim=1)
-        self.state = state.detach().clone()
+        self.state = torch.cat([types, adhesion, morphogen, center], dim=1)
         return self.get_observation()
 
     # ----- observation retrieval -----
     def get_observation(self):
         """
         Depending on mode:
-          - global: returns full grid state (detached clone)
-          - local: returns (patches, coords) computed from detached clone
+          - global: returns full grid state
+          - local: returns (patches, coords)
         """
         if self.obs_mode == 'global':
-            return self.state.detach().clone()
+            return self.state.clone()
         elif self.obs_mode == 'local':
-            # call extract_local_patches on a detached clone to be safe
-            patches, coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
+            patches, coords = extract_local_patches(self.state, patch_size=5)
             return patches, coords
         else:
             raise ValueError("obs_mode must be 'global' or 'local'")
+
+    # ----- utility helpers -----
+    def _sorting_index(self, state):
+        """
+        Computes a simple spatial sorting index:
+        |mean(TYPE_A on left half) - mean(TYPE_A on right half)|
+
+        state: (B, C, H, W)
+        returns: (B,) tensor with positive values indicating stronger left/right segregation
+        """
+        # state: (B, C, H, W)
+        # TYPE_A is the channel index for cell type A (imported from dca)
+        A = state[:, TYPE_A]  # (B, H, W)
+
+        mid = self.W // 2
+        # left and right region means across spatial dims (H, W_region)
+        left = A[:, :, :mid].mean(dim=[1,2])
+        right = A[:, :, mid:].mean(dim=[1,2])
+
+        return torch.abs(left - right)  # (B,)
 
     # ----- stepping the environment -----
     def step(self, actions):
@@ -160,47 +193,41 @@ class SortingEnv:
         actions:
           - if global mode: tensor (B,3,H,W)
           - if local mode: per-cell actions (B,N,3) that will be reshaped to grid
-        Returns:
-          observation, reward (detached), info (cpu tensors)
         """
-        # defensive checks
-        if self.state is None:
-            raise RuntimeError("Environment not reset. Call reset() before step().")
-
         B = self.state.shape[0]
 
         if self.obs_mode == 'local':
             # reshape per-cell actions to grid (B,3,H,W)
             N = self.H * self.W
-            assert actions.shape[1] == N, f"expected actions second dim {N}, got {actions.shape[1]}"
-            # actions expected (B, N, A) -> transpose to (B, A, H, W)
+            assert actions.shape[1] == N
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
-        # Run environment dynamics under no_grad so env ops don't create graph
-        with torch.no_grad():
-            s = self.state
-            for _ in range(self.steps_per_action):
-                # dca may modify or return new tensor; keep return and then detach/clone
-                s = self.dca(s, actions, steps=1)
-            # ensure any underlying storage is detached and independent
-            self.state = s.detach().clone()
+        s = self.state
+        for _ in range(self.steps_per_action):
+            s = self.dca(s, actions, steps=1)
+        self.state = s
 
-            # compute metrics using detached tensors
-            e = interfacial_energy(self.state).detach()
-            mpen = motion_penalty(actions.detach()).detach()
+        # compute base metrics
+        e = interfacial_energy(self.state)
+        mpen = motion_penalty(actions)
 
-            reward = -(e + self.gamma_motion * mpen)
-            # info should be CPU tensors for logging
-            info = {
-                "interfacial_energy": e.cpu(),
-                "motion_penalty": mpen.cpu()
-            }
+        # -------- Sorting Index Reward (positive shaping term) --------
+        # Measures how well TYPE_A segregates left vs right.
+        # scaling factor chosen small to act as a shaping reward alongside penalties.
+        sorting_index = self._sorting_index(self.state)  # (B,)
+        sorting_reward = 0.05 * sorting_index            # adjust factor if needed
 
-        # return safe (detached) observation and reward
+        # total reward: penalties (energy + motion) with positive sorting reward
+        reward = -e - self.gamma_motion * mpen + sorting_reward
+
+        info = {
+            "interfacial_energy": e.detach().cpu(),
+            "motion_penalty": mpen.detach().cpu(),
+            "sorting_index": sorting_index.detach().cpu(),
+        }
         return self.get_observation(), reward.detach(), info
 
     # ----- utility -----
     def current_state(self):
         """Return a detached copy of the full grid state (B,5,H,W)."""
-        return self.state.detach().clone()
-
+        return self.state.clone().detach()
