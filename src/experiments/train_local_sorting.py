@@ -145,18 +145,45 @@ def main():
         adv_f = adv.unsqueeze(2).repeat(1,1,N).reshape(S)
 
         # Update
+        # ppo_update(
+        #     policy,
+        #     optimz,
+        #     obs_f,
+        #     act_f,
+        #     logp_f,
+        #     ret_f,
+        #     adv_f,
+        #     clip_ratio=CLIP,
+        #     epochs=EPOCHS,
+        #     batch_size=MINI_BATCH
+        # )
+# --- normalize advantages (important for stable PPO updates) ---
+        adv_f = adv_f.clone()
+        adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
+
+# (optional) normalize returns to stabilize value loss — uncomment if you want
+# ret_f = ret_f.clone()
+# ret_f = (ret_f - ret_f.mean()) / (ret_f.std() + 1e-8)
+
+# make sure optimizer variable name is correct (original had 'optimz' which looks like a typo)
+# if your optimizer variable really is named 'optimz', either rename it to `optimizer` or replace below.
         ppo_update(
             policy,
-            optimz,
+            optimz,            # << replace with `optimz` only if that's your actual variable name
             obs_f,
             act_f,
             logp_f,
             ret_f,
             adv_f,
-            clip_ratio=CLIP,
+            clip_ratio=CLIP,      # keep your global CLIP (0.2) or try 0.1 if updates are aggressive
+            value_coef=0.25,      # reduce value loss weight so actor gradients aren't dominated
+            entropy_coef=0.02,    # slightly larger entropy to encourage exploration
             epochs=EPOCHS,
-            batch_size=MINI_BATCH
+            batch_size=MINI_BATCH,
         )
+
+
+        
 
         # Diagnostics
         mean_r = rews.mean().item()
