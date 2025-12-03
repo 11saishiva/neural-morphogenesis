@@ -260,13 +260,13 @@ W = 32
 PATCH_SIZE = 5
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 32            # rollout length
-TOTAL_UPDATES = 1000    # full run target
+T_STEPS = 8            # rollout length(was 32)
+TOTAL_UPDATES = 50    # full run target
 
 GAMMA = 0.99            # environment return discount (set sensible RL default)
 LAM = 0.95
 EPOCHS = 1
-MINI_BATCH = 2048
+MINI_BATCH = 512 #was 2048 
 LR = 1e-4               # safer, smaller lr
 CLIP = 0.1
 
