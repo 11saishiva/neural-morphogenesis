@@ -109,21 +109,12 @@
 #         """Return a detached copy of the full grid state (B,5,H,W)."""
 #         return self.state.detach().clone()
 
-# src/envs/wrappers.py
 import torch
 import torch.nn.functional as F
-from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
+from .dca import DCA, TYPE_A, TYPE_B
 from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
 class SortingEnv:
-    """
-    Cell-sorting environment with both global and local (5x5x4) observation modes.
-
-    Modes:
-      - 'global': returns full grid state (B,5,H,W)
-      - 'local': returns per-cell patches (B,N,4,5,5) + coords
-    """
-
     def __init__(self, H=64, W=64, device='cpu', gamma_motion=0.1,
                  steps_per_action=1, obs_mode='local'):
         self.H, self.W = H, W
@@ -131,10 +122,10 @@ class SortingEnv:
         self.gamma_motion = gamma_motion
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
+
         self.dca = DCA().to(self.device)
         self.state = None
 
-    # ----- state initialization -----
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
         return x
@@ -149,85 +140,62 @@ class SortingEnv:
         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
         morphogen = self._make_morphogen(B)
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
+
         self.state = torch.cat([types, adhesion, morphogen, center], dim=1)
         return self.get_observation()
 
-    # ----- observation retrieval -----
     def get_observation(self):
-        """
-        Depending on mode:
-          - global: returns full grid state
-          - local: returns (patches, coords)
-        """
-        if self.obs_mode == 'global':
-            return self.state.clone()
-        elif self.obs_mode == 'local':
+        if self.obs_mode == "global":
+            return self.state.clone().detach()
+
+        elif self.obs_mode == "local":
             patches, coords = extract_local_patches(self.state, patch_size=5)
-            return patches, coords
+            return patches.contiguous(), coords
+
         else:
-            raise ValueError("obs_mode must be 'global' or 'local'")
+            raise ValueError("obs_mode must be global or local")
 
-    # ----- utility helpers -----
+    # Sorting index
     def _sorting_index(self, state):
-        """
-        Computes a simple spatial sorting index:
-        |mean(TYPE_A on left half) - mean(TYPE_A on right half)|
-
-        state: (B, C, H, W)
-        returns: (B,) tensor with positive values indicating stronger left/right segregation
-        """
-        # state: (B, C, H, W)
-        # TYPE_A is the channel index for cell type A (imported from dca)
-        A = state[:, TYPE_A]  # (B, H, W)
-
+        A = state[:, TYPE_A]
         mid = self.W // 2
-        # left and right region means across spatial dims (H, W_region)
         left = A[:, :, :mid].mean(dim=[1,2])
         right = A[:, :, mid:].mean(dim=[1,2])
+        return torch.abs(left - right)
 
-        return torch.abs(left - right)  # (B,)
-
-    # ----- stepping the environment -----
     def step(self, actions):
-        """
-        actions:
-          - if global mode: tensor (B,3,H,W)
-          - if local mode: per-cell actions (B,N,3) that will be reshaped to grid
-        """
         B = self.state.shape[0]
 
-        if self.obs_mode == 'local':
-            # reshape per-cell actions to grid (B,3,H,W)
+        if self.obs_mode == "local":
             N = self.H * self.W
-            assert actions.shape[1] == N
-            actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
+            actions = actions.transpose(1,2).reshape(B, 3, self.H, self.W)
 
         s = self.state
+
+        # SAFE contiguous input to DCA
+        s = s.contiguous()
+        actions = actions.contiguous()
+
         for _ in range(self.steps_per_action):
             s = self.dca(s, actions, steps=1)
+
         self.state = s
 
-        # compute base metrics
         e = interfacial_energy(self.state)
-        mpen = motion_penalty(actions)
+        m = motion_penalty(actions)
 
-        # -------- Sorting Index Reward (positive shaping term) --------
-        # Measures how well TYPE_A segregates left vs right.
-        # scaling factor chosen small to act as a shaping reward alongside penalties.
-        sorting_index = self._sorting_index(self.state)  # (B,)
-        sorting_reward = 0.05 * sorting_index            # adjust factor if needed
+        sorting_index = self._sorting_index(self.state)
+        sorting_reward = 0.05 * sorting_index
 
-        # total reward: penalties (energy + motion) with positive sorting reward
-        reward = -e - self.gamma_motion * mpen + sorting_reward
+        reward = -e - self.gamma_motion * m + sorting_reward
 
         info = {
             "interfacial_energy": e.detach().cpu(),
-            "motion_penalty": mpen.detach().cpu(),
-            "sorting_index": sorting_index.detach().cpu(),
+            "motion_penalty": m.detach().cpu(),
+            "sorting_index": sorting_index.detach().cpu()
         }
+
         return self.get_observation(), reward.detach(), info
 
-    # ----- utility -----
     def current_state(self):
-        """Return a detached copy of the full grid state (B,5,H,W)."""
-        return self.state.clone().detach()
+        return self.state.detach().clone()
