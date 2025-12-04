@@ -260,10 +260,11 @@ from src.utils.metrics import interfacial_energy, motion_penalty
 H = 32
 W = 32
 PATCH_SIZE = 5
+POLICY_IN_CH = 4          # policy expects 4 channels per patch
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 8            # rollout length
-TOTAL_UPDATES = 50     # full run target
+T_STEPS = 8               # rollout length
+TOTAL_UPDATES = 50        # small run for testing
 
 GAMMA = 0.99
 LAM = 0.95
@@ -284,55 +285,37 @@ os.makedirs("visuals", exist_ok=True)
 # --------------------------------------------
 
 def state_to_img(state):
-    """Converts env.current_state() -> H x W x 3 uint8 image (visualization)."""
+    """Convert env.current_state() -> H x W x 3 uint8 image."""
     if isinstance(state, torch.Tensor):
         s = state.detach().cpu().numpy()
     else:
         s = np.array(state)
 
-    # Normalize to a single HxW image
-    try:
-        if s.ndim == 4:
-            # (B,C,H,W) -> take first sample
-            s = s[0]
-        if s.ndim == 3:
-            # (C,H,W) -> mean channels
-            if s.shape[0] <= 10 and s.shape[1] == H and s.shape[2] == W:
-                img = np.mean(s, axis=0)
-            else:
-                # maybe (N,C) with N==H*W
-                if s.shape[0] == H * W:
-                    ch = 2 if s.shape[1] > 2 else 0
-                    img = s[:, ch].reshape(H, W)
-                else:
-                    img = np.mean(s, axis=-1)
-        elif s.ndim == 2:
-            if s.shape[0] == H and s.shape[1] == W:
-                img = s
-            elif s.shape[0] == H * W:
-                img = s.reshape(H, W)
-            else:
-                flat = np.asarray(s).flatten()
-                img = flat[:H * W].reshape(H, W)
-        elif s.ndim == 1:
-            flat = s
-            if flat.size >= H * W:
-                img = flat[:H * W].reshape(H, W)
-            else:
-                tmp = np.zeros(H * W, dtype=flat.dtype)
-                tmp[:flat.size] = flat
-                img = tmp.reshape(H, W)
+    # reduce batched dims if present
+    if s.ndim == 4 and s.shape[0] == BATCH:  # (B,C,H,W)
+        s = s[0]
+    # if s is (C,H,W) -> take mean across channels
+    if s.ndim == 3 and s.shape[0] <= 6 and s.shape[1] == H and s.shape[2] == W:
+        img = np.mean(s, axis=0)
+    elif s.ndim == 3 and s.shape[0] == H * W:
+        # (N,C) flatten where N==H*W
+        ch = 2 if s.shape[1] > 2 else 0
+        img = s[:, ch].reshape(H, W)
+    elif s.ndim == 2 and s.shape == (H, W):
+        img = s
+    else:
+        flat = np.asarray(s).flatten()
+        if flat.size >= H * W:
+            img = flat[:H*W].reshape(H, W)
         else:
-            img = np.mean(s)
-            img = np.full((H, W), img, dtype=np.float32)
-    except Exception:
-        img = np.zeros((H, W), dtype=np.float32)
+            tmp = np.zeros(H * W, dtype=flat.dtype)
+            tmp[:flat.size] = flat
+            img = tmp.reshape(H, W)
 
     img = np.nan_to_num(img)
-    img = img - np.min(img)
-    maxv = np.max(img) if np.max(img) != 0 else 1.0
-    img = img / maxv
-    img = (img * 255.0).astype(np.uint8)
+    img = img - img.min()
+    maxv = img.max() if img.max() > 0 else 1.0
+    img = (img / maxv * 255.0).astype(np.uint8)
     rgb = np.stack([img, img, img], axis=-1)
     return rgb
 
@@ -341,11 +324,13 @@ def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
     patches, coords = env.reset(B=1, pA=0.5)
     N_local = env.H * env.W
     for t in range(steps):
-        # patches: (B,N,C,ph,pw) -> select first 4 channels then flatten
-        flat = patches[:, :, :4, :, :].contiguous().view(BATCH * N_local, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        # select first POLICY_IN_CH channels from patches
+        patches_sel = patches[..., :POLICY_IN_CH, :, :].contiguous()
+        flat = patches_sel.reshape(BATCH * N_local, POLICY_IN_CH, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
         with torch.no_grad():
             a, logp, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        act = a.contiguous().view(BATCH, N_local, ACTION_DIM)
+
+        act = a.contiguous().reshape(BATCH, N_local, ACTION_DIM)
         if clamp_actions:
             act = act.clamp(-1.0, 1.0)
         (patches, coords), reward, _ = env.step(act)
@@ -360,26 +345,26 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # temp: enable anomaly detection when debugging gradients
+    # Uncomment to get autograd anomaly stack if you face in-place modification errors:
     # torch.autograd.set_detect_anomaly(True)
 
-    # NOTE: sorting_weight set to 1.0 for quick signal testing. Change back to 0.05 later.
-    env = SortingEnv(H=H, W=W, device=DEVICE, gamma_motion=0.01,
-                     steps_per_action=1, obs_mode="local", sorting_weight=1.0)
+    env = SortingEnv(H=H, W=W, device=DEVICE, gamma_motion=0.01, steps_per_action=1, obs_mode="local")
 
     policy = NeuroFuzzyActorCritic(
-        in_ch=4,
+        in_ch=POLICY_IN_CH,
         patch_size=PATCH_SIZE,
         feat_dim=48,
         fuzzy_features=12,
         action_dim=ACTION_DIM
     ).to(DEVICE)
 
-    # initialize small policy std via raw_logstd parameter if present
+    # initialize small logstd if policy exposes it
     try:
         with torch.no_grad():
             if hasattr(policy, "raw_logstd"):
                 policy.raw_logstd.data.fill_(-2.0)
+            elif hasattr(policy, "logstd") and isinstance(policy.logstd, torch.nn.Parameter):
+                policy.logstd.data.fill_(-2.0)
     except Exception:
         pass
 
@@ -387,22 +372,15 @@ def main():
 
     N = H * W
 
-    rewards_hist = []
-    energy_hist = []
-    motion_hist = []
+    rewards_hist, energy_hist, motion_hist = [], [], []
     frames = []
     eval_count = 0
-
     start_time = time.time()
 
     for update in range(TOTAL_UPDATES):
-        # Reset environment & get local observation: patches shape = (B, N, C, ph, pw)
         patches, coords = env.reset(B=BATCH, pA=0.5)
-        # quick log of sample shape
-        if update == 0:
-            print(f"[info] sample patches shape: {patches.shape} -> b={patches.shape[0]} n={patches.shape[1]} c={patches.shape[2]} ph={patches.shape[3]} pw={patches.shape[4]}")
 
-        # capture visual frame
+        # store visual frames (rolling)
         try:
             frames.append(state_to_img(env.current_state()))
         except Exception:
@@ -410,33 +388,36 @@ def main():
         if len(frames) > MAX_SAVE_FRAMES:
             frames.pop(0)
 
-        # rollout buffers
         obs_buf, act_buf, logp_buf, val_buf = [], [], [], []
         rew_buf, done_buf = [], []
 
         for t in range(T_STEPS):
-            # patches: (B,N,C,ph,pw) -> select first 4 channels -> (B*N,4,ph,pw)
-            flat = patches[:, :, :4, :, :].contiguous().view(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            # patches shape: (B, N, C, p, p). select first POLICY_IN_CH channels
+            # make contiguous before reshape and .to()
+            patches_sel = patches[..., :POLICY_IN_CH, :, :].contiguous()
+            flat = patches_sel.reshape(BATCH * N, POLICY_IN_CH, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
 
-            # diagnostics
             if t == 0:
                 try:
-                    current_std_mean = (torch.exp(policy.logstd).mean().item()) if hasattr(policy, "logstd") else float("nan")
+                    current_std = (policy.raw_logstd.exp().mean().item()
+                                   if hasattr(policy, "raw_logstd")
+                                   else (policy.logstd.exp().mean().item() if hasattr(policy, "logstd") else float("nan")))
                 except Exception:
-                    current_std_mean = float("nan")
-                print(f"[UPDATE {update:04d} T{t}] action_mean_abs={a.abs().mean().item():.4f} policy_std_mean={current_std_mean:.4f}")
+                    current_std = float("nan")
+                print(f"[UPDATE {update:04d} T{t}] action_mean_abs={a.abs().mean().item():.4f} policy_std_mean={current_std:.4f}")
 
-            act = a.contiguous().view(BATCH, N, ACTION_DIM)
+            act = a.contiguous().reshape(BATCH, N, ACTION_DIM)
             act = act.clamp(-1.0, 1.0)
-            lp = logp.contiguous().view(BATCH, N)
-            val = v.contiguous().view(BATCH, N).mean(1)
+
+            lp = logp.contiguous().reshape(BATCH, N)
+            val = v.contiguous().reshape(BATCH, N).mean(1)
 
             (patches, coords), reward, _ = env.step(act)
 
-            obs_buf.append(patches.cpu())   # keep on CPU
+            obs_buf.append(patches.cpu())    # keep CPU copies to build rollout buffers
             act_buf.append(act.cpu())
             logp_buf.append(lp.cpu())
             val_buf.append(val.cpu())
@@ -445,14 +426,15 @@ def main():
 
         # bootstrap final value (deterministic)
         with torch.no_grad():
-            flat = patches[:, :, :4, :, :].contiguous().view(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            patches_sel = patches[..., :POLICY_IN_CH, :, :].contiguous()
+            flat = patches_sel.reshape(BATCH * N, POLICY_IN_CH, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
             _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        val_buf.append(v.contiguous().view(BATCH, N).mean(1).cpu())
+        val_buf.append(v.contiguous().reshape(BATCH, N).mean(1).cpu())
 
         # stack buffers
         T = T_STEPS
-        obs = torch.stack(obs_buf)               # (T,B,N,C,ph,pw)
-        acts = torch.stack(act_buf)              # (T,B,N,3)
+        obs = torch.stack(obs_buf)               # (T,B,N,C,p,p)
+        acts = torch.stack(act_buf)              # (T,B,N,A)
         logps = torch.stack(logp_buf)            # (T,B,N)
         rews = torch.stack(rew_buf)              # (T,B)
         dones = torch.stack(done_buf)            # (T,B)
@@ -461,19 +443,25 @@ def main():
         # compute GAE & returns
         adv, ret = compute_gae(rews, vals, dones, GAMMA, LAM)
 
-        # flatten for ppo update; select first 4 channels from obs
+        # flatten for ppo update - ensure contiguous before reshape
         S = T * BATCH * N
-        obs_f = obs[:, :, :, :4, :, :].contiguous().reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
+        # select correct C (POLICY_IN_CH) from obs; obs shape (T,B,N,C,p,p)
+        obs = obs.contiguous()
+        obs_f = obs.reshape(S, obs.shape[3], PATCH_SIZE, PATCH_SIZE)  # obs.shape[3] is channel dim
+        # If env unexpectedly returned C != POLICY_IN_CH, crop/expand to match
+        if obs_f.shape[1] != POLICY_IN_CH:
+            if obs_f.shape[1] > POLICY_IN_CH:
+                obs_f = obs_f[:, :POLICY_IN_CH, :, :].contiguous()
+            else:
+                # pad channels with zeros
+                pad_ch = POLICY_IN_CH - obs_f.shape[1]
+                pad = torch.zeros((obs_f.shape[0], pad_ch, PATCH_SIZE, PATCH_SIZE), dtype=obs_f.dtype)
+                obs_f = torch.cat([obs_f, pad], dim=1).contiguous()
+
         act_f = acts.contiguous().reshape(S, ACTION_DIM)
         logp_f = logps.contiguous().reshape(S)
         ret_f = ret.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
         adv_f = adv.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
-
-        # minibatch safety
-        if MINI_BATCH > S:
-            effective_minibatch = max(1, S)
-        else:
-            effective_minibatch = MINI_BATCH
 
         # normalize advantages
         adv_f = adv_f.clone()
@@ -482,7 +470,7 @@ def main():
         # PPO update
         logs = ppo_update(
             policy,
-            optimz,                 # optimizer variable name is `optimz`
+            optimz,
             obs_f,
             act_f,
             logp_f,
@@ -492,27 +480,23 @@ def main():
             value_coef=0.25,
             entropy_coef=0.005,
             epochs=EPOCHS,
-            batch_size=effective_minibatch,
+            batch_size=MINI_BATCH,
         )
 
         # Diagnostics
         mean_r = rews.mean().item()
         mean_e = interfacial_energy(env.current_state()).mean().item()
         try:
-            act_dev = act_f.contiguous().view(T, BATCH, N, ACTION_DIM).to(DEVICE)
+            act_dev = act_f.contiguous().reshape(T, BATCH, N, ACTION_DIM).to(DEVICE)
             mean_m = motion_penalty(act_dev.transpose(1, 2)).mean().item()
         except Exception:
             mean_m = act_f.abs().mean().item()
-
-        # sorting index diagnostic
-        with torch.no_grad():
-            sort_idx = env._sorting_index(env.current_state()).mean().item()
 
         rewards_hist.append(mean_r)
         energy_hist.append(mean_e)
         motion_hist.append(mean_m)
 
-        print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f} | sort_idx={sort_idx:.6f}")
+        print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f}")
 
         # checkpoint
         if update % SAVE_CHECKPOINT_EVERY == 0:
@@ -549,7 +533,7 @@ def main():
     plt.savefig("visuals/training_metrics.png")
     plt.close()
 
-    # final video
+    # final video from saved frames
     try:
         if len(frames) == 0:
             print("[viz] no frames recorded.")
