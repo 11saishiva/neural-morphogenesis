@@ -316,22 +316,34 @@ class SortingEnv:
             # Slightly reduce sort_weight to avoid overpowering other penalties.
             # Keep original linear sort_bonus * sort_idx.
             # -------------------------------
-            eps = 1e-6
-            beta = float(self._pos_scale_beta)
+                        # -------------------------------
+            # Safer normalization for pos_delta:
+            # - faster EMA for scale (beta)
+            # - larger eps floor
+            # - clamp normalized progress to [0, 1.0]
+            # - slightly smaller sort_weight
+            # -------------------------------
+            eps = 1e-3                      # larger epsilon to avoid tiny denominators
+            beta = 0.05                     # faster but still conservative scale update
 
             # update running scale with EMA of abs(pos_delta)
-            # shape: (B,)
             abs_pd = pos_delta.abs()
+            # initialize _pos_delta_scale on device if needed (safety)
+            if self._pos_delta_scale is None:
+                self._pos_delta_scale = torch.zeros_like(abs_pd)
             self._pos_delta_scale = (1.0 - beta) * self._pos_delta_scale.to(abs_pd.device) + beta * abs_pd
 
-            # prevent extremely small scale
             scale = self._pos_delta_scale + eps
 
-            # normalized positive delta (safe)
+            # normalized positive delta, clipped to [0, 1]
             norm_pos = pos_delta / scale
+            norm_pos = torch.clamp(norm_pos, 0.0, 1.0)
+
+            # slightly reduce sort_weight (avoid domination)
+            effective_sort_weight = max(200.0, float(self.sort_weight)) * 0.5
 
             # reward: normalized progress + linear sort bonus - penalties
-            reward = (self.sort_weight * norm_pos) + (self.sort_bonus * sort_idx) \
+            reward = (effective_sort_weight * norm_pos) + (self.sort_bonus * sort_idx) \
                      - (self.energy_weight * e) - (self.motion_weight * mpen)
 
             # clip for stability
