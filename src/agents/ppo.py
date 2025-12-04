@@ -226,11 +226,11 @@ def ppo_update(
 
     for epoch in range(epochs):
         for obs_b, act_b, logp_old_b, ret_b, adv_b in loader:
-            obs_b = obs_b.to(device).contiguous()
-            act_b = act_b.to(device).contiguous()
-            logp_old_b = logp_old_b.to(device)
-            ret_b = ret_b.to(device)
-            adv_b = adv_b.to(device)
+            obs_b = obs_b.to(device, non_blocking=True).contiguous()
+            act_b = act_b.to(device, non_blocking=True)
+            logp_old_b = logp_old_b.to(device, non_blocking=True)
+            ret_b = ret_b.to(device, non_blocking=True)
+            adv_b = adv_b.to(device, non_blocking=True)
 
 
             # normalize advantages for this minibatch
