@@ -243,7 +243,7 @@
 # ------------------------------------------------------------
 # CLEAN WORKING TRAINING SCRIPT FOR LOCAL SORTING (COLAB SAFE)
 # ------------------------------------------------------------
-
+# src/experiments/train_local_sorting.py
 import os
 import gc
 import time
@@ -289,86 +289,55 @@ os.makedirs("visuals", exist_ok=True)
 def state_to_img(state):
     """Converts env.current_state() -> H x W x 3 uint8 image (visualization).
     Accepts either a torch.Tensor or numpy array."""
-    # Convert torch -> numpy if needed
     if isinstance(state, torch.Tensor):
         s = state.detach().cpu().numpy()
     else:
         s = np.array(state)
 
-    # If batched as (B, C, H, W) or (B, N, C)
-    # Try to reduce to a single 2D image
-    # If first dim equals batch size, take first sample
-    if s.ndim == 4:
-        # e.g., (B, C, H, W) or (B, N, C, something) - prefer first sample
+    # reduce batch dim if present
+    if s.ndim == 4 and s.shape[0] > 1:
         s = s[0]
+
+    # Try common shapes and reduce to (H, W)
+    img = None
     if s.ndim == 3:
-        # Could be (C,H,W) or (N, C) where N==H*W
-        # If third dim equals W or H, try treating as (H,W,C)
+        # (C, H, W) or (H, W, C) or (N, C) where N==H*W
         if s.shape[0] in (H, W) and s.shape[1] in (H, W):
-            # already (H, W, C) or (C,H,W) ambiguous: attempt to produce grayscale
-            try:
-                # if shape (C,H,W) convert to (H,W) by picking channel or mean
-                if s.shape[0] <= 4 and s.shape[1] == H and s.shape[2] == W:
-                    # s is (C,H,W)
-                    img = np.mean(s, axis=0)
-                else:
-                    img = np.mean(s, axis=-1)
-            except Exception:
-                img = np.mean(s, axis=-1)
-        else:
-            # maybe (N, C) where N == H*W - common in your pipeline
-            if s.shape[0] == H * W:
-                # pick a channel if multiple channels
-                if s.shape[1] > 1:
-                    ch = 2 if s.shape[1] > 2 else 0
-                    img = s[:, ch].reshape(H, W)
-                else:
-                    img = s[:, 0].reshape(H, W)
+            # likely (H, W, C) or (C, H, W)
+            if s.shape[-1] == W and s.shape[-2] == H:
+                img = np.mean(s, axis=-1) if s.ndim == 3 else np.mean(s, axis=0)
             else:
-                # fallback: mean across last axis then try reshape
+                # fallback to channel mean
+                img = np.mean(s, axis=0) if s.shape[0] <= 4 else np.mean(s, axis=-1)
+        else:
+            # possibly (N, C) where N == H*W
+            if s.shape[0] == H * W:
+                ch = 2 if s.shape[1] > 2 else 0
+                img = s[:, ch].reshape(H, W)
+            else:
                 img = np.mean(s, axis=-1)
-                if img.size != H * W:
-                    img = np.resize(img, (H, W))
     elif s.ndim == 2:
-        # either (H, W) already or (N, C) with N==H*W
         if s.shape[0] == H and s.shape[1] == W:
             img = s
-        elif s.shape[0] == H * W:
-            # single channel flattened
-            img = s.reshape(H, W)
+        elif s.size == H * W:
+            img = s.flatten()[:H*W].reshape(H, W)
         else:
-            # assume (N, C)
-            if s.shape[0] == H * W:
-                img = s[:, 0].reshape(H, W)
-            else:
-                # fallback: reshape or resize
-                flat = np.asarray(s).flatten()
-                if flat.size >= H * W:
-                    img = flat[:H * W].reshape(H, W)
-                else:
-                    tmp = np.zeros(H * W, dtype=flat.dtype)
-                    tmp[:flat.size] = flat
-                    img = tmp.reshape(H, W)
+            # fallback
+            flat = s.flatten()
+            tmp = np.zeros(H * W, dtype=flat.dtype)
+            tmp[:min(flat.size, H * W)] = flat[:min(flat.size, H * W)]
+            img = tmp.reshape(H, W)
     elif s.ndim == 1:
         flat = s
-        if flat.size == H * W:
-            img = flat.reshape(H, W)
+        if flat.size >= H * W:
+            img = flat[:H * W].reshape(H, W)
         else:
-            side = int(math.sqrt(flat.size))
-            if side * side == flat.size:
-                img = flat.reshape(side, side)
-            else:
-                tmp = np.zeros(H * W, dtype=flat.dtype)
-                length = min(flat.size, H * W)
-                tmp[:length] = flat[:length]
-                img = tmp.reshape(H, W)
+            tmp = np.zeros(H * W, dtype=flat.dtype)
+            tmp[:flat.size] = flat
+            img = tmp.reshape(H, W)
     else:
-        # last resort: mean across all axes and resize
-        img = np.mean(s)
-        img = np.full((H, W), img, dtype=np.float32)
+        img = np.full((H, W), float(np.mean(s)), dtype=np.float32)
 
-    # Normalize to 0-255
-    # guard against nan
     img = np.nan_to_num(img)
     img = img - np.min(img)
     maxv = np.max(img)
@@ -382,13 +351,15 @@ def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
     """Run a deterministic rollout (no sampling) and return a list of frames."""
     frames = []
     patches, coords = env.reset(B=1, pA=0.5)
-    N_local = env.H * env.W
+    # infer shapes robustly
+    b_p, n_p, c_p, ph, pw = patches.shape
+    assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patch shape: {patches.shape}"
     for t in range(steps):
-        flat = patches.contiguous().reshape(BATCH * N_local, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
         with torch.no_grad():
-            a, logp, vals, _, _ = policy.get_action_and_value(flat, deterministic=True)
+            a, logp, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
 
-        act = a.contiguous().reshape(BATCH, N_local, ACTION_DIM)
+        act = a.contiguous().view(b_p, n_p, ACTION_DIM)
         if clamp_actions:
             act = act.clamp(-1.0, 1.0)
         (patches, coords), reward, _ = env.step(act)
@@ -403,9 +374,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Optionally enable anomaly detection temporarily to get better stack traces (uncomment if debugging)
-    # torch.autograd.set_detect_anomaly(True)
-
+    # env & model
     env = SortingEnv(H=H, W=W, device=DEVICE, gamma_motion=0.01, steps_per_action=1, obs_mode="local")
 
     policy = NeuroFuzzyActorCritic(
@@ -418,16 +387,17 @@ def main():
 
     # safer initial logstd (reduce initial exploration magnitude)
     with torch.no_grad():
-        if hasattr(policy, "logstd"):
-            policy.logstd.data.fill_(-2.0)  # std ~= exp(-2) ~ 0.135
+        # NeuroFuzzy exposes raw_logstd/logstd differently; attempt safe init
+        if hasattr(policy, "raw_logstd"):
+            policy.raw_logstd.data.fill_(-2.0)
+        elif hasattr(policy, "logstd"):
             try:
-                print(f"[INIT] set policy.logstd -> mean={policy.logstd.data.mean().item():.3f} (std~{policy.logstd.exp().mean().item():.4f})")
+                # if property backed by parameter this may fail — ignore if so
+                policy.logstd.data.fill_(-2.0)
             except Exception:
-                print("[INIT] policy.logstd initialized")
+                pass
 
     optimz = optim.Adam(policy.parameters(), lr=LR)
-
-    N = H * W
 
     rewards_hist = []
     energy_hist = []
@@ -455,8 +425,10 @@ def main():
 
         # rollout
         for t in range(T_STEPS):
-            # ensure contiguous memory before moving to device and reshape
-            flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            # infer actual patch dims and reshape robustly
+            b_p, n_p, c_p, ph, pw = patches.shape
+            assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patches shape: {patches.shape}"
+            flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
@@ -464,18 +436,17 @@ def main():
             # diagnostics: action magnitude & policy std
             if t == 0:
                 try:
-                    current_std = policy.logstd.exp().mean().item() if hasattr(policy, "logstd") else float('nan')
+                    current_std = (policy.logstd.exp().mean().item() if hasattr(policy, "logstd") else float('nan'))
                 except Exception:
                     current_std = float('nan')
                 mu_abs = a.abs().mean().item()
                 print(f"[UPDATE {update:04d} T{t}] action_mean_abs={mu_abs:.4f} policy_std_mean={current_std:.4f}")
 
-            act = a.contiguous().reshape(BATCH, N, ACTION_DIM)
-            # clamp actions to prevent runaway motion (diagnostic / safety). Keep if env expects [-1,1].
+            act = a.contiguous().view(b_p, n_p, ACTION_DIM)
             act = act.clamp(-1.0, 1.0)
 
-            lp = logp.contiguous().reshape(BATCH, N)
-            val = v.contiguous().reshape(BATCH, N).mean(1)
+            lp = logp.contiguous().view(b_p, n_p)
+            val = v.contiguous().view(b_p, n_p).mean(1)
 
             (patches, coords), reward, _ = env.step(act)
 
@@ -489,37 +460,38 @@ def main():
 
         # bootstrap final value (deterministic)
         with torch.no_grad():
-            flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            b_p, n_p, c_p, ph, pw = patches.shape
+            assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patches shape: {patches.shape}"
+            flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
             _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        val_buf.append(v.contiguous().reshape(BATCH, N).mean(1).cpu())
+        val_buf.append(v.contiguous().view(b_p, n_p).mean(1).cpu())
 
-        # stack buffers
+        # stack buffers (use actual shapes)
         T = T_STEPS
-        obs = torch.stack(obs_buf)               # (T,B,N,4,5,5)
-        acts = torch.stack(act_buf)              # (T,B,N,3)
-        logps = torch.stack(logp_buf)            # (T,B,N)
-        rews = torch.stack(rew_buf)              # (T,B)
-        dones = torch.stack(done_buf)            # (T,B)
-        vals = torch.stack(val_buf)              # (T+1,B)
+        obs = torch.stack(obs_buf)               # (T, B_actual, N_actual, C, p, p)
+        acts = torch.stack(act_buf)              # (T, B_actual, N_actual, A)
+        logps = torch.stack(logp_buf)            # (T, B_actual, N_actual)
+        rews = torch.stack(rew_buf)              # (T, B_actual)
+        dones = torch.stack(done_buf)            # (T, B_actual)
+        vals = torch.stack(val_buf)              # (T+1, B_actual)
 
         # compute GAE & returns
         adv, ret = compute_gae(rews, vals, dones, GAMMA, LAM)
 
-        # flatten for ppo update - ensure contiguous before reshape
-        S = T * BATCH * N
-        obs_f = obs.contiguous().reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
-        act_f = acts.contiguous().reshape(S, ACTION_DIM)
-        logp_f = logps.contiguous().reshape(S)
-        ret_f = ret.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
-        adv_f = adv.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
+        # flatten for ppo update - infer real sizes from obs
+        T0, b_obs, n_obs, c_obs, ph, pw = obs.shape
+        assert c_obs == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected obs shape: {obs.shape}"
+        S = T0 * b_obs * n_obs
+
+        obs_f = obs.contiguous().view(S, c_obs, ph, pw)
+        act_f = acts.contiguous().view(S, ACTION_DIM)
+        logp_f = logps.contiguous().view(S)
+        ret_f = ret.unsqueeze(2).repeat(1,1,n_obs).contiguous().view(S)
+        adv_f = adv.unsqueeze(2).repeat(1,1,n_obs).contiguous().view(S)
 
         # normalize advantages (important)
         adv_f = adv_f.clone()
         adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
-
-        # optional: normalize returns (commented by default)
-        # ret_f = ret_f.clone()
-        # ret_f = (ret_f - ret_f.mean()) / (ret_f.std() + 1e-8)
 
         # PPO update with safer hyperparameters
         logs = ppo_update(
@@ -540,12 +512,11 @@ def main():
         # Diagnostics (compute components cleanly)
         mean_r = rews.mean().item()
         mean_e = interfacial_energy(env.current_state()).mean().item()
-        # motion penalty expects actions shaped like (B, A, H, W) or similar; reuse motion_penalty helper:
         try:
-            act_dev = act_f.contiguous().reshape(T, BATCH, N, ACTION_DIM).to(DEVICE)
+            # use actual b_obs/n_obs when reshaping
+            act_dev = act_f.contiguous().view(T0, b_obs, n_obs, ACTION_DIM).to(DEVICE)
             mean_m = motion_penalty(act_dev.transpose(1, 2)).mean().item()
         except Exception:
-            # fallback: compute a simple action magnitude metric
             mean_m = act_f.abs().mean().item()
 
         rewards_hist.append(mean_r)
