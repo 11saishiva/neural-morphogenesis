@@ -260,10 +260,10 @@ W = 32
 PATCH_SIZE = 5
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 8            # rollout length
-TOTAL_UPDATES = 50
+T_STEPS = 32            # rollout length
+TOTAL_UPDATES = 500
 
-GAMMA = 0.99
+GAMMA = 0.005
 LAM = 0.95
 EPOCHS = 1
 MINI_BATCH = 512
@@ -273,7 +273,7 @@ CLIP = 0.1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SAVE_CHECKPOINT_EVERY = 50
-DETERMINISTIC_EVAL_EVERY = 100
+DETERMINISTIC_EVAL_EVERY = 10
 DETERMINISTIC_EVAL_STEPS = 64
 MAX_SAVE_FRAMES = 200
 
