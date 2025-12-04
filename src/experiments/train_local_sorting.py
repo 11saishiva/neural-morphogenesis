@@ -239,6 +239,11 @@
 # - action diagnostics and deterministic eval snapshots
 # ------------------------------------------------------------
 
+# src/experiments/train_local_sorting.py
+# ------------------------------------------------------------
+# CLEAN WORKING TRAINING SCRIPT FOR LOCAL SORTING (COLAB SAFE)
+# ------------------------------------------------------------
+
 import os
 import gc
 import time
@@ -282,49 +287,94 @@ os.makedirs("visuals", exist_ok=True)
 # --------------------------------------------
 
 def state_to_img(state):
-    """Converts env.current_state() -> H x W x 3 uint8 image (visualization)."""
+    """Converts env.current_state() -> H x W x 3 uint8 image (visualization).
+    Accepts either a torch.Tensor or numpy array."""
+    # Convert torch -> numpy if needed
     if isinstance(state, torch.Tensor):
         s = state.detach().cpu().numpy()
     else:
         s = np.array(state)
 
-    # if batch present, take first
-    if s.ndim == 3 and s.shape[0] == BATCH:
+    # If batched as (B, C, H, W) or (B, N, C)
+    # Try to reduce to a single 2D image
+    # If first dim equals batch size, take first sample
+    if s.ndim == 4:
+        # e.g., (B, C, H, W) or (B, N, C, something) - prefer first sample
         s = s[0]
-
-    # expecting (N, C) where N == H*W OR a flat H*W arr
-    if s.ndim == 2:
-        N, C = s.shape
-        ch = 2 if C > 2 else 0
-        try:
-            img = s[:, ch].contiguous().reshape(H, W)
-        except Exception:
-            img = s.mean(axis=1).contiguous().reshape(H, W)
-    elif s.ndim == 1:
-        if s.size == H * W:
-            img = s.contiguous().reshape(H, W)
+    if s.ndim == 3:
+        # Could be (C,H,W) or (N, C) where N==H*W
+        # If third dim equals W or H, try treating as (H,W,C)
+        if s.shape[0] in (H, W) and s.shape[1] in (H, W):
+            # already (H, W, C) or (C,H,W) ambiguous: attempt to produce grayscale
+            try:
+                # if shape (C,H,W) convert to (H,W) by picking channel or mean
+                if s.shape[0] <= 4 and s.shape[1] == H and s.shape[2] == W:
+                    # s is (C,H,W)
+                    img = np.mean(s, axis=0)
+                else:
+                    img = np.mean(s, axis=-1)
+            except Exception:
+                img = np.mean(s, axis=-1)
         else:
-            side = int(math.sqrt(s.size))
-            if side * side == s.size:
-                img = s.contiguous().reshape(side, side)
+            # maybe (N, C) where N == H*W - common in your pipeline
+            if s.shape[0] == H * W:
+                # pick a channel if multiple channels
+                if s.shape[1] > 1:
+                    ch = 2 if s.shape[1] > 2 else 0
+                    img = s[:, ch].reshape(H, W)
+                else:
+                    img = s[:, 0].reshape(H, W)
             else:
-                flat = np.zeros(H * W, dtype=s.dtype)
-                length = min(s.size, H*W)
-                flat[:length] = s[:length]
-                img = flat.contiguous().reshape(H, W)
-    elif s.ndim == 2 and s.shape[0] == H and s.shape[1] == W:
-        img = s
+                # fallback: mean across last axis then try reshape
+                img = np.mean(s, axis=-1)
+                if img.size != H * W:
+                    img = np.resize(img, (H, W))
+    elif s.ndim == 2:
+        # either (H, W) already or (N, C) with N==H*W
+        if s.shape[0] == H and s.shape[1] == W:
+            img = s
+        elif s.shape[0] == H * W:
+            # single channel flattened
+            img = s.reshape(H, W)
+        else:
+            # assume (N, C)
+            if s.shape[0] == H * W:
+                img = s[:, 0].reshape(H, W)
+            else:
+                # fallback: reshape or resize
+                flat = np.asarray(s).flatten()
+                if flat.size >= H * W:
+                    img = flat[:H * W].reshape(H, W)
+                else:
+                    tmp = np.zeros(H * W, dtype=flat.dtype)
+                    tmp[:flat.size] = flat
+                    img = tmp.reshape(H, W)
+    elif s.ndim == 1:
+        flat = s
+        if flat.size == H * W:
+            img = flat.reshape(H, W)
+        else:
+            side = int(math.sqrt(flat.size))
+            if side * side == flat.size:
+                img = flat.reshape(side, side)
+            else:
+                tmp = np.zeros(H * W, dtype=flat.dtype)
+                length = min(flat.size, H * W)
+                tmp[:length] = flat[:length]
+                img = tmp.reshape(H, W)
     else:
-        # fallback: mean across channels then reshape if possible
-        img = np.mean(s, axis=-1)
-        if img.size != H * W:
-            img = np.resize(img, (H, W))
+        # last resort: mean across all axes and resize
+        img = np.mean(s)
+        img = np.full((H, W), img, dtype=np.float32)
 
-    # normalize 0-255
-    img = img - np.nanmin(img)
-    if np.nanmax(img) > 0:
-        img = img / np.nanmax(img)
-    img = (img * 255).astype(np.uint8)
+    # Normalize to 0-255
+    # guard against nan
+    img = np.nan_to_num(img)
+    img = img - np.min(img)
+    maxv = np.max(img)
+    if maxv > 0:
+        img = img / maxv
+    img = (img * 255.0).astype(np.uint8)
     rgb = np.stack([img, img, img], axis=-1)
     return rgb
 
@@ -332,12 +382,13 @@ def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
     """Run a deterministic rollout (no sampling) and return a list of frames."""
     frames = []
     patches, coords = env.reset(B=1, pA=0.5)
+    N_local = env.H * env.W
     for t in range(steps):
-        flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        flat = patches.contiguous().reshape(BATCH * N_local, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
         with torch.no_grad():
-            _, _, vals, _, _ = policy.get_action_and_value(flat, deterministic=True)
+            a, logp, vals, _, _ = policy.get_action_and_value(flat, deterministic=True)
 
-        act = a.contiguous().reshape(BATCH, env.H * env.W, ACTION_DIM)
+        act = a.contiguous().reshape(BATCH, N_local, ACTION_DIM)
         if clamp_actions:
             act = act.clamp(-1.0, 1.0)
         (patches, coords), reward, _ = env.step(act)
@@ -351,6 +402,9 @@ def main():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Optionally enable anomaly detection temporarily to get better stack traces (uncomment if debugging)
+    # torch.autograd.set_detect_anomaly(True)
 
     env = SortingEnv(H=H, W=W, device=DEVICE, gamma_motion=0.01, steps_per_action=1, obs_mode="local")
 
@@ -366,7 +420,10 @@ def main():
     with torch.no_grad():
         if hasattr(policy, "logstd"):
             policy.logstd.data.fill_(-2.0)  # std ~= exp(-2) ~ 0.135
-            print(f"[INIT] set policy.logstd -> mean={policy.logstd.data.mean().item():.3f} (std~{policy.logstd.exp().mean().item():.4f})")
+            try:
+                print(f"[INIT] set policy.logstd -> mean={policy.logstd.data.mean().item():.3f} (std~{policy.logstd.exp().mean().item():.4f})")
+            except Exception:
+                print("[INIT] policy.logstd initialized")
 
     optimz = optim.Adam(policy.parameters(), lr=LR)
 
@@ -398,6 +455,7 @@ def main():
 
         # rollout
         for t in range(T_STEPS):
+            # ensure contiguous memory before moving to device and reshape
             flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
 
             with torch.no_grad():
@@ -421,6 +479,7 @@ def main():
 
             (patches, coords), reward, _ = env.step(act)
 
+            # move observation tensors to CPU for buffering (keep them pinned if needed)
             obs_buf.append(patches.cpu())
             act_buf.append(act.cpu())
             logp_buf.append(lp.cpu())
@@ -446,7 +505,7 @@ def main():
         # compute GAE & returns
         adv, ret = compute_gae(rews, vals, dones, GAMMA, LAM)
 
-        # flatten for ppo update
+        # flatten for ppo update - ensure contiguous before reshape
         S = T * BATCH * N
         obs_f = obs.contiguous().reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
         act_f = acts.contiguous().reshape(S, ACTION_DIM)
