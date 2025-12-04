@@ -240,9 +240,6 @@
 # ------------------------------------------------------------
 
 # src/experiments/train_local_sorting.py
-# ------------------------------------------------------------
-# CLEAN WORKING TRAINING SCRIPT FOR LOCAL SORTING (COLAB SAFE)
-# ------------------------------------------------------------
 # src/experiments/train_local_sorting.py
 import os
 import gc
@@ -262,67 +259,61 @@ from src.utils.metrics import interfacial_energy, motion_penalty
 # ------------------ CONFIG ------------------
 H = 32
 W = 32
-PATCH_SIZE = 5
+PATCH_SIZE = 5        # nominal patch size (kept for readability)
 ACTION_DIM = 3
 BATCH = 1
-T_STEPS = 8            # rollout length(was 32)
-TOTAL_UPDATES = 50    # full run target
+T_STEPS = 8            # rollout length
+TOTAL_UPDATES = 50     # full run target
 
-GAMMA = 0.99            # environment return discount (set sensible RL default)
+GAMMA = 0.99
 LAM = 0.95
 EPOCHS = 1
-MINI_BATCH = 512 #was 2048 
-LR = 1e-4               # safer, smaller lr
+MINI_BATCH = 512
+LR = 1e-4
 CLIP = 0.1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SAVE_CHECKPOINT_EVERY = 50     # checkpoint cadence
-DETERMINISTIC_EVAL_EVERY = 100 # save a deterministic eval rollout every this many updates
-DETERMINISTIC_EVAL_STEPS = 64  # steps in a deterministic evaluation rollout
-MAX_SAVE_FRAMES = 200          # keep last N frames for final video
+SAVE_CHECKPOINT_EVERY = 50
+DETERMINISTIC_EVAL_EVERY = 100
+DETERMINISTIC_EVAL_STEPS = 64
+MAX_SAVE_FRAMES = 200
 
 os.makedirs("checkpoints", exist_ok=True)
 os.makedirs("visuals", exist_ok=True)
 # --------------------------------------------
 
-def state_to_img(state):
-    """Converts env.current_state() -> H x W x 3 uint8 image (visualization).
-    Accepts either a torch.Tensor or numpy array."""
+def state_to_img(state, H=H, W=W):
+    """Convert env.current_state() -> H x W x 3 uint8 image."""
     if isinstance(state, torch.Tensor):
         s = state.detach().cpu().numpy()
     else:
         s = np.array(state)
 
-    # reduce batch dim if present
+    # collapse batch dim if present
     if s.ndim == 4 and s.shape[0] > 1:
         s = s[0]
 
-    # Try common shapes and reduce to (H, W)
+    # Try to reduce to H x W
     img = None
     if s.ndim == 3:
         # (C, H, W) or (H, W, C) or (N, C) where N==H*W
-        if s.shape[0] in (H, W) and s.shape[1] in (H, W):
-            # likely (H, W, C) or (C, H, W)
-            if s.shape[-1] == W and s.shape[-2] == H:
-                img = np.mean(s, axis=-1) if s.ndim == 3 else np.mean(s, axis=0)
-            else:
-                # fallback to channel mean
-                img = np.mean(s, axis=0) if s.shape[0] <= 4 else np.mean(s, axis=-1)
+        if s.shape[0] == 3 and s.shape[1] == H and s.shape[2] == W:
+            img = np.mean(s, axis=0)
+        elif s.shape[-2:] == (H, W):
+            img = np.mean(s, axis=-1)
+        elif s.shape[0] == H * W:
+            # (N, C)
+            ch = 2 if s.shape[1] > 2 else 0
+            img = s[:, ch].reshape(H, W)
         else:
-            # possibly (N, C) where N == H*W
-            if s.shape[0] == H * W:
-                ch = 2 if s.shape[1] > 2 else 0
-                img = s[:, ch].reshape(H, W)
-            else:
-                img = np.mean(s, axis=-1)
+            img = np.mean(s, axis=-1)
     elif s.ndim == 2:
-        if s.shape[0] == H and s.shape[1] == W:
+        if s.shape == (H, W):
             img = s
         elif s.size == H * W:
-            img = s.flatten()[:H*W].reshape(H, W)
+            img = s.flatten()[:H * W].reshape(H, W)
         else:
-            # fallback
             flat = s.flatten()
             tmp = np.zeros(H * W, dtype=flat.dtype)
             tmp[:min(flat.size, H * W)] = flat[:min(flat.size, H * W)]
@@ -336,24 +327,21 @@ def state_to_img(state):
             tmp[:flat.size] = flat
             img = tmp.reshape(H, W)
     else:
-        img = np.full((H, W), float(np.mean(s)), dtype=np.float32)
+        img = np.full((H, W), float(np.nanmean(s)), dtype=np.float32)
 
     img = np.nan_to_num(img)
     img = img - np.min(img)
-    maxv = np.max(img)
-    if maxv > 0:
-        img = img / maxv
+    maxv = np.max(img) if np.max(img) != 0 else 1.0
+    img = img / maxv
     img = (img * 255.0).astype(np.uint8)
     rgb = np.stack([img, img, img], axis=-1)
     return rgb
 
 def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
-    """Run a deterministic rollout (no sampling) and return a list of frames."""
     frames = []
     patches, coords = env.reset(B=1, pA=0.5)
-    # infer shapes robustly
+    # infer dims
     b_p, n_p, c_p, ph, pw = patches.shape
-    assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patch shape: {patches.shape}"
     for t in range(steps):
         flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
         with torch.no_grad():
@@ -374,44 +362,46 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # env & model
+    # Create env first so we can infer patch/channel dims
     env = SortingEnv(H=H, W=W, device=DEVICE, gamma_motion=0.01, steps_per_action=1, obs_mode="local")
 
+    # inspect a sample observation to infer channels & N
+    patches_sample, coords_sample = env.reset(B=1, pA=0.5)
+    b_s, n_s, c_s, ph_s, pw_s = patches_sample.shape
+    print(f"[info] sample patches shape: {patches_sample.shape} -> b={b_s} n={n_s} c={c_s} ph={ph_s} pw={pw_s}")
+
+    # Build policy using correct input channels
     policy = NeuroFuzzyActorCritic(
-        in_ch=4,
-        patch_size=PATCH_SIZE,
+        in_ch=c_s,
+        patch_size=ph_s,
         feat_dim=48,
         fuzzy_features=12,
         action_dim=ACTION_DIM
     ).to(DEVICE)
 
-    # safer initial logstd (reduce initial exploration magnitude)
+    # initialize a conservative std
     with torch.no_grad():
-        # NeuroFuzzy exposes raw_logstd/logstd differently; attempt safe init
         if hasattr(policy, "raw_logstd"):
             policy.raw_logstd.data.fill_(-2.0)
         elif hasattr(policy, "logstd"):
             try:
-                # if property backed by parameter this may fail — ignore if so
                 policy.logstd.data.fill_(-2.0)
             except Exception:
                 pass
 
     optimz = optim.Adam(policy.parameters(), lr=LR)
 
-    rewards_hist = []
-    energy_hist = []
-    motion_hist = []
-    frames = []            # rolling store of frames for final video
+    rewards_hist, energy_hist, motion_hist = [], [], []
+    frames = []
     eval_count = 0
-
     start_time = time.time()
 
     for update in range(TOTAL_UPDATES):
-        # Reset environment & get local observation
         patches, coords = env.reset(B=BATCH, pA=0.5)
+        # infer shape each loop (robust)
+        b_p, n_p, c_p, ph, pw = patches.shape
 
-        # Capture a frame for quick visuals
+        # quick frame
         try:
             frames.append(state_to_img(env.current_state()))
         except Exception:
@@ -419,38 +409,29 @@ def main():
         if len(frames) > MAX_SAVE_FRAMES:
             frames.pop(0)
 
-        # Rollout storage (kept on CPU where possible)
         obs_buf, act_buf, logp_buf, val_buf = [], [], [], []
         rew_buf, done_buf = [], []
 
-        # rollout
         for t in range(T_STEPS):
-            # infer actual patch dims and reshape robustly
-            b_p, n_p, c_p, ph, pw = patches.shape
-            assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patches shape: {patches.shape}"
+            # make contiguous and reshape using inferred dims
             flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
 
-            # diagnostics: action magnitude & policy std
             if t == 0:
                 try:
                     current_std = (policy.logstd.exp().mean().item() if hasattr(policy, "logstd") else float('nan'))
                 except Exception:
                     current_std = float('nan')
-                mu_abs = a.abs().mean().item()
-                print(f"[UPDATE {update:04d} T{t}] action_mean_abs={mu_abs:.4f} policy_std_mean={current_std:.4f}")
+                print(f"[UPDATE {update:04d} T{t}] action_mean_abs={a.abs().mean().item():.4f} policy_std_mean={current_std:.4f}")
 
-            act = a.contiguous().view(b_p, n_p, ACTION_DIM)
-            act = act.clamp(-1.0, 1.0)
-
+            act = a.contiguous().view(b_p, n_p, ACTION_DIM).clamp(-1.0, 1.0)
             lp = logp.contiguous().view(b_p, n_p)
             val = v.contiguous().view(b_p, n_p).mean(1)
 
             (patches, coords), reward, _ = env.step(act)
 
-            # move observation tensors to CPU for buffering (keep them pinned if needed)
             obs_buf.append(patches.cpu())
             act_buf.append(act.cpu())
             logp_buf.append(lp.cpu())
@@ -458,62 +439,59 @@ def main():
             rew_buf.append(reward.cpu())
             done_buf.append(torch.zeros_like(reward.cpu()))
 
-        # bootstrap final value (deterministic)
+        # bootstrap final value
         with torch.no_grad():
-            b_p, n_p, c_p, ph, pw = patches.shape
-            assert c_p == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected patches shape: {patches.shape}"
-            flat = patches.contiguous().view(b_p * n_p, c_p, ph, pw).to(DEVICE)
+            b_p2, n_p2, c_p2, ph2, pw2 = patches.shape
+            flat = patches.contiguous().view(b_p2 * n_p2, c_p2, ph2, pw2).to(DEVICE)
             _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        val_buf.append(v.contiguous().view(b_p, n_p).mean(1).cpu())
+        val_buf.append(v.contiguous().view(b_p2, n_p2).mean(1).cpu())
 
-        # stack buffers (use actual shapes)
+        # stack
         T = T_STEPS
-        obs = torch.stack(obs_buf)               # (T, B_actual, N_actual, C, p, p)
-        acts = torch.stack(act_buf)              # (T, B_actual, N_actual, A)
-        logps = torch.stack(logp_buf)            # (T, B_actual, N_actual)
-        rews = torch.stack(rew_buf)              # (T, B_actual)
-        dones = torch.stack(done_buf)            # (T, B_actual)
-        vals = torch.stack(val_buf)              # (T+1, B_actual)
+        obs = torch.stack(obs_buf)    # (T, B, N, C, ph, pw)
+        acts = torch.stack(act_buf)   # (T, B, N, A)
+        logps = torch.stack(logp_buf) # (T, B, N)
+        rews = torch.stack(rew_buf)   # (T, B)
+        dones = torch.stack(done_buf) # (T, B)
+        vals = torch.stack(val_buf)   # (T+1, B)
 
-        # compute GAE & returns
+        # GAE
         adv, ret = compute_gae(rews, vals, dones, GAMMA, LAM)
 
-        # flatten for ppo update - infer real sizes from obs
-        T0, b_obs, n_obs, c_obs, ph, pw = obs.shape
-        assert c_obs == 4 and ph == PATCH_SIZE and pw == PATCH_SIZE, f"unexpected obs shape: {obs.shape}"
+        # flatten robustly using actual shapes
+        T0, b_obs, n_obs, c_obs, ph_obs, pw_obs = obs.shape
         S = T0 * b_obs * n_obs
 
-        obs_f = obs.contiguous().view(S, c_obs, ph, pw)
+        obs_f = obs.contiguous().view(S, c_obs, ph_obs, pw_obs)
         act_f = acts.contiguous().view(S, ACTION_DIM)
         logp_f = logps.contiguous().view(S)
         ret_f = ret.unsqueeze(2).repeat(1,1,n_obs).contiguous().view(S)
         adv_f = adv.unsqueeze(2).repeat(1,1,n_obs).contiguous().view(S)
 
-        # normalize advantages (important)
+        # normalize advantages
         adv_f = adv_f.clone()
         adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
 
-        # PPO update with safer hyperparameters
+        # PPO update
         logs = ppo_update(
             policy,
-            optimz,                 # note: your optimizer variable name is `optimz`
+            optimz,
             obs_f,
             act_f,
             logp_f,
             ret_f,
             adv_f,
             clip_ratio=CLIP,
-            value_coef=0.25,        # reduce value weight a bit
-            entropy_coef=0.005,     # smaller entropy -> less random motor babbling
+            value_coef=0.25,
+            entropy_coef=0.005,
             epochs=EPOCHS,
             batch_size=MINI_BATCH,
         )
 
-        # Diagnostics (compute components cleanly)
+        # diagnostics
         mean_r = rews.mean().item()
         mean_e = interfacial_energy(env.current_state()).mean().item()
         try:
-            # use actual b_obs/n_obs when reshaping
             act_dev = act_f.contiguous().view(T0, b_obs, n_obs, ACTION_DIM).to(DEVICE)
             mean_m = motion_penalty(act_dev.transpose(1, 2)).mean().item()
         except Exception:
@@ -525,13 +503,11 @@ def main():
 
         print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f}")
 
-        # checkpoint
         if update % SAVE_CHECKPOINT_EVERY == 0:
             ckpt_path = f"checkpoints/ppo_{update:04d}.pt"
             torch.save(policy.state_dict(), ckpt_path)
             print(f"[ckpt] saved {ckpt_path}")
 
-        # deterministic eval snapshot (visual check without sampling noise)
         if (update + 1) % DETERMINISTIC_EVAL_EVERY == 0:
             eval_frames = deterministic_rollout_frames(env, policy, steps=DETERMINISTIC_EVAL_STEPS, clamp_actions=True)
             eval_fn = f"visuals/eval_{eval_count:03d}.mp4"
@@ -544,29 +520,19 @@ def main():
 
     # plotting
     plt.figure(figsize=(10,6))
-    plt.subplot(3,1,1)
-    plt.plot(rewards_hist, label="reward")
-    plt.ylabel("reward")
-    plt.legend()
-    plt.subplot(3,1,2)
-    plt.plot(energy_hist, label="energy")
-    plt.ylabel("energy")
-    plt.legend()
-    plt.subplot(3,1,3)
-    plt.plot(motion_hist, label="motion penalty")
-    plt.ylabel("motion")
-    plt.legend()
+    plt.subplot(3,1,1); plt.plot(rewards_hist); plt.ylabel("reward")
+    plt.subplot(3,1,2); plt.plot(energy_hist); plt.ylabel("energy")
+    plt.subplot(3,1,3); plt.plot(motion_hist); plt.ylabel("motion")
     plt.tight_layout()
     plt.savefig("visuals/training_metrics.png")
     plt.close()
 
-    # create final short video from saved frames (if any)
     try:
-        if len(frames) == 0:
-            print("[viz] no frames recorded.")
-        else:
+        if len(frames) > 0:
             imageio.mimwrite("visuals/sort_perf.mp4", frames, fps=10)
             print("[viz] saved visuals/sort_perf.mp4")
+        else:
+            print("[viz] no frames recorded.")
     except Exception as e:
         print("[viz] failed to write final video:", e)
 
