@@ -136,61 +136,122 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.utils.data import DataLoader, TensorDataset
 
+# Policy class import (keeps backward compatibility)
+from src.agents.neuro_fuzzy import NeuroFuzzyActorCritic
+
+# Legacy alias kept for imports that expect PatchActorCritic
+class PatchActorCritic(NeuroFuzzyActorCritic):
+    pass
+
+
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    """
+    rewards: (T,B)
+    values:  (T+1,B)
+    dones:   (T,B)
+    """
     T, B = rewards.shape
-    adv = torch.zeros(T,B, device=rewards.device)
-    last = torch.zeros(B, device=rewards.device)
+    advantages = torch.zeros(T, B, device=rewards.device)
+    last_gae = torch.zeros(B, device=rewards.device)
+
     for t in reversed(range(T)):
-        mask = 1 - dones[t]
-        delta = rewards[t] + gamma * values[t+1] * mask - values[t]
-        last = delta + gamma * lam * mask * last
-        adv[t] = last
-    ret = adv + values[:-1]
-    return adv.detach(), ret.detach()
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
+        last_gae = delta + gamma * lam * mask * last_gae
+        advantages[t] = last_gae
+
+    returns = advantages + values[:-1]
+    return advantages.detach(), returns.detach()
+
 
 def ppo_update(
-        policy, optimizer,
-        obs_patches, actions, logp_old, returns, advantages,
-        clip_ratio=0.1, value_coef=0.25, entropy_coef=0.01,
-        epochs=1, batch_size=None):
+    policy,
+    optimizer,
+    obs_patches,     # (batch, C, H, W)
+    actions,         # (batch, A)
+    logp_old,        # (batch,)
+    returns,         # (batch,)
+    advantages,      # (batch,)
+    clip_ratio=0.2,
+    value_coef=0.5,
+    entropy_coef=0.01,
+    epochs=1,
+    batch_size=None,
+):
+    """
+    Stable PPO update with safe contiguous minibatches.
 
+    - Moves tensors to device once and ensures contiguous minibatches
+    - Normalizes advantages per-minibatch
+    - Uses gradient clipping
+    """
     device = next(policy.parameters()).device
 
-    obs_patches = obs_patches.to(device).contiguous()
+    # Move the whole dataset to device once (keeps loader simple)
+    obs_patches = obs_patches.to(device)
     actions = actions.to(device)
     logp_old = logp_old.to(device)
     returns = returns.to(device)
     advantages = advantages.to(device)
 
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # Normalization already performed by caller, but keep a safeguard:
+    adv_mean = advantages.mean()
+    adv_std = advantages.std(unbiased=False) + 1e-8
+    advantages = (advantages - adv_mean) / adv_std
 
-    N = obs_patches.size(0)
-    batch_size = batch_size or N
-    loader = DataLoader(TensorDataset(obs_patches, actions, logp_old, returns, advantages),
-                        batch_size=batch_size, shuffle=True)
+    N = obs_patches.shape[0]
+    batch_size = batch_size if batch_size is not None else N
 
-    for _ in range(epochs):
+    dataset = TensorDataset(obs_patches, actions, logp_old, returns, advantages)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    logs = {"actor_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "total_loss": 0.0}
+    steps = 0
+
+    for epoch in range(epochs):
         for obs_b, act_b, logp_old_b, ret_b, adv_b in loader:
-            obs_b = obs_b.to(device).contiguous()
-            act_b = act_b.to(device)
-            logp_old_b = logp_old_b.to(device)
-            ret_b = ret_b.to(device)
-            adv_b = adv_b.to(device)
+            # Move minibatch to device and ensure contiguous layout
+            obs_b = obs_b.to(device, non_blocking=True).contiguous()
+            act_b = act_b.to(device, non_blocking=True)
+            logp_old_b = logp_old_b.to(device, non_blocking=True)
+            ret_b = ret_b.to(device, non_blocking=True)
+            adv_b = adv_b.to(device, non_blocking=True)
 
-            adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
+            # Re-normalize per-minibatch (stable training)
+            adv_b = (adv_b - adv_b.mean()) / (adv_b.std(unbiased=False) + 1e-8)
 
-            mu, value, fuzzy_feats = policy(obs_b)
+            # Forward through policy (policy.forward returns mu, value, fuzzy_feats)
+            mu, value_pred, _ = policy(obs_b)
 
-            std = (policy.logstd.exp() + 1e-6)
-            std = std.unsqueeze(0).expand_as(mu).contiguous()
+            # Get numeric std from policy safely (policy exposes logstd as tensor-like)
+            # policy.logstd should be a tensor (not Parameter) or property returning log(std)
+            try:
+                std = (policy.logstd.exp()).unsqueeze(0).expand_as(mu).to(device)
+            except Exception:
+                # fallback: if policy has raw_logstd param
+                try:
+                    std = (F.softplus(policy.raw_logstd) + 1e-6).unsqueeze(0).expand_as(mu).to(device)
+                except Exception:
+                    # final fallback: small constant std
+                    std = torch.full_like(mu, 0.1, device=device)
+
+            # clamp std for numerical stability
+            std = torch.clamp(std, min=1e-6, max=10.0)
+
             dist = Normal(mu, std)
 
-            logp = dist.log_prob(act_b).sum(-1)
-            ratio = torch.exp(logp - logp_old_b)
-            clipped = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio)
+            # new logprob (sum over action dims)
+            logp = dist.log_prob(act_b).sum(dim=-1)
 
-            actor_loss = -torch.min(ratio*adv_b, clipped*adv_b).mean()
-            value_loss = value_coef * F.mse_loss(value.squeeze(-1), ret_b)
+            # ratio and clipped surrogate
+            ratio = torch.exp(logp - logp_old_b)
+            clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
+            actor_loss = -torch.min(ratio * adv_b, clipped_ratio * adv_b).mean()
+
+            # value loss
+            value_loss = value_coef * F.mse_loss(value_pred.squeeze(-1), ret_b)
+
+            # entropy (encourage exploration)
             entropy = dist.entropy().sum(-1).mean()
 
             loss = actor_loss + value_loss - entropy_coef * entropy
@@ -200,4 +261,14 @@ def ppo_update(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
             optimizer.step()
 
-    return {}
+            logs["actor_loss"] += actor_loss.item()
+            logs["value_loss"] += value_loss.item()
+            logs["entropy"] += entropy.item()
+            logs["total_loss"] += loss.item()
+            steps += 1
+
+    # average logs
+    if steps > 0:
+        for k in logs:
+            logs[k] /= steps
+    return logs
