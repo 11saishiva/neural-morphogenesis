@@ -1,4 +1,3 @@
-# # src/envs/wrappers.py
 # import torch
 # import torch.nn.functional as F
 # from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
@@ -19,6 +18,16 @@
 #         self.obs_mode = obs_mode
 #         self.dca = DCA().to(self.device)
 #         self.state = None
+
+#         # Reward shaping coefficients (tuned for stronger learning signal)
+#         # sort_weight gives positive reward for moving A toward left/right separation
+#         self.sort_weight = 1.0
+#         # penalize interfacial energy more strongly (encourages clustering)
+#         self.energy_weight = 10.0
+#         # motion penalty scale (keep moderate)
+#         self.motion_weight = 1.0
+#         # clip rewards for numerical stability
+#         self.reward_clip = 10.0
 
 #     def _make_morphogen(self, B):
 #         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -86,17 +95,25 @@
 #             s = self.state
 #             for _ in range(self.steps_per_action):
 #                 s = self.dca(s, actions, steps=1)
+#             # detach snapshot after dynamics
 #             self.state = s.detach().clone()
 
-#             e = interfacial_energy(self.state).detach()
-#             mpen = motion_penalty(actions.detach()).detach()
+#             # compute metrics using detached tensors
+#             e = interfacial_energy(self.state).detach()      # (B,)
+#             mpen = motion_penalty(actions.detach()).detach() # (B,)
+#             sort_idx = self._sorting_index(self.state).detach() # (B,)
 
-#             # optional shaping: sorting index (small positive reward) can be added externally
-#             reward = -(e + self.gamma_motion * mpen)
+#             # Reward: positive for sorting progress, negative for energy & motion.
+#             # Multiply by weights tuned to give visible learning signal.
+#             reward = (self.sort_weight * sort_idx) - (self.energy_weight * e) - (self.motion_weight * mpen)
+
+#             # clip for safety
+#             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
 #             info = {
 #                 "interfacial_energy": e.cpu(),
 #                 "motion_penalty": mpen.cpu(),
+#                 "sort_index": sort_idx.cpu()
 #             }
 
 #         return self.get_observation(), reward.detach(), info
@@ -126,14 +143,15 @@ class SortingEnv:
         self.state = None
 
         # Reward shaping coefficients (tuned for stronger learning signal)
-        # sort_weight gives positive reward for moving A toward left/right separation
-        self.sort_weight = 1.0
-        # penalize interfacial energy more strongly (encourages clustering)
-        self.energy_weight = 10.0
-        # motion penalty scale (keep moderate)
-        self.motion_weight = 1.0
-        # clip rewards for numerical stability
-        self.reward_clip = 10.0
+        # We'll reward *progress* in sorting (delta of sort_index).
+        # Because sort_index is small in absolute value, we scale the delta.
+        self.sort_weight = 1000.0    # scale applied to delta(sort_idx)
+        self.energy_weight = 10.0    # penalize interfacial energy
+        self.motion_weight = 1.0     # motion penalty scale
+        self.reward_clip = 10.0      # clip rewards for safety
+
+        # track last sort index per-batch so we can reward progress
+        self._last_sort_idx = None
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -153,6 +171,13 @@ class SortingEnv:
         state = torch.cat([types, adhesion, morphogen, center], dim=1)
         # detach to prevent accidental autograd from environment state
         self.state = state.detach().clone()
+
+        # initialize last_sort_idx to the current sorting index (detached)
+        with torch.no_grad():
+            cur_sort = self._sorting_index(self.state).detach()
+            # store on device but we'll use detached cpu tensors for rewards/infos
+            self._last_sort_idx = cur_sort.clone()
+
         return self.get_observation()
 
     def get_observation(self):
@@ -209,9 +234,18 @@ class SortingEnv:
             mpen = motion_penalty(actions.detach()).detach() # (B,)
             sort_idx = self._sorting_index(self.state).detach() # (B,)
 
-            # Reward: positive for sorting progress, negative for energy & motion.
-            # Multiply by weights tuned to give visible learning signal.
-            reward = (self.sort_weight * sort_idx) - (self.energy_weight * e) - (self.motion_weight * mpen)
+            # compute delta sort index (progress) per-batch
+            if self._last_sort_idx is None:
+                delta_sort = sort_idx.clone()
+            else:
+                # both are tensors on same device
+                delta_sort = sort_idx - self._last_sort_idx
+
+            # update last_sort_idx for next step
+            self._last_sort_idx = sort_idx.clone()
+
+            # Reward: reward progress (delta), penalize energy & motion
+            reward = (self.sort_weight * delta_sort) - (self.energy_weight * e) - (self.motion_weight * mpen)
 
             # clip for safety
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
@@ -219,7 +253,8 @@ class SortingEnv:
             info = {
                 "interfacial_energy": e.cpu(),
                 "motion_penalty": mpen.cpu(),
-                "sort_index": sort_idx.cpu()
+                "sort_index": sort_idx.cpu(),
+                "delta_sort_index": delta_sort.cpu()
             }
 
         return self.get_observation(), reward.detach(), info
