@@ -150,7 +150,7 @@ class SortingEnv:
         self.reward_clip = 10.0
 
         # EMA smoothing for delta_sort — tiny alpha to keep signal directional
-        self.sort_ema_alpha = 0.18   # 0.1 is small but effective
+        self.sort_ema_alpha = 0.2   # 0.1 is small but effective
         self._sort_ema = None        # will be initialized in reset per-batch
         self._last_sort_idx = None   # store last sort_idx for delta computation
 
@@ -266,13 +266,23 @@ class SortingEnv:
             # positive-only smoothed delta
             pos_delta = torch.relu(self._sort_ema)
 
-            # reward: strong encouragement for sustained positive progress + small bonus for current sort idx
-            reward = (self.sort_weight * pos_delta) + (self.sort_bonus * sort_idx) \
+            if not hasattr(self, "_sort_idx_ema") or self._sort_idx_ema is None \
+               or self._sort_idx_ema.shape[0] != sort_idx.shape[0]:
+                # initialize on same device/dtype as sort_idx
+                self._sort_idx_ema = torch.zeros_like(sort_idx)
+            # update sort-index EMA (use same alpha for simplicity; you may use a separate alpha if desired)
+            self._sort_idx_ema = (1.0 - alpha) * self._sort_idx_ema.to(sort_idx.device) + alpha * sort_idx
+
+            # reward: encourage sustained positive progress (pos_delta) + sustained high sort index (smoothed)
+            # subtract penalties (energy and motion) as before
+            sort_progress_contrib = self.sort_weight * pos_delta
+            sort_sustained_contrib = self.sort_bonus * self._sort_idx_ema
+
+            reward = sort_progress_contrib + sort_sustained_contrib \
                      - (self.energy_weight * e) - (self.motion_weight * mpen)
 
             # clip for stability
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
-
 
             info = {
                 "interfacial_energy": e.cpu(),
