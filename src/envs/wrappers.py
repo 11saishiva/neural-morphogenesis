@@ -212,6 +212,7 @@ class SortingEnv:
         right = A[:, :, mid:].mean(dim=[1,2])
         return torch.abs(left - right)
 
+
     def step(self, actions):
         """
         actions:
@@ -266,23 +267,13 @@ class SortingEnv:
             # positive-only smoothed delta
             pos_delta = torch.relu(self._sort_ema)
 
-            if not hasattr(self, "_sort_idx_ema") or self._sort_idx_ema is None \
-               or self._sort_idx_ema.shape[0] != sort_idx.shape[0]:
-                # initialize on same device/dtype as sort_idx
-                self._sort_idx_ema = torch.zeros_like(sort_idx)
-            # update sort-index EMA (use same alpha for simplicity; you may use a separate alpha if desired)
-            self._sort_idx_ema = (1.0 - alpha) * self._sort_idx_ema.to(sort_idx.device) + alpha * sort_idx
-
-            # reward: encourage sustained positive progress (pos_delta) + sustained high sort index (smoothed)
-            # subtract penalties (energy and motion) as before
-            sort_progress_contrib = self.sort_weight * pos_delta
-            sort_sustained_contrib = self.sort_bonus * self._sort_idx_ema
-
-            reward = sort_progress_contrib + sort_sustained_contrib \
+            # reward: strong encouragement for sustained positive progress + small bonus for current sort idx
+            reward = (self.sort_weight * pos_delta) + (self.sort_bonus * sort_idx) \
                      - (self.energy_weight * e) - (self.motion_weight * mpen)
 
             # clip for stability
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
+
 
             info = {
                 "interfacial_energy": e.cpu(),
