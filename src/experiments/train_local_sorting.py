@@ -506,8 +506,9 @@ def main():
         rewards_hist.append(mean_r)
         energy_hist.append(mean_e)
         motion_hist.append(mean_m)
+        sorting_idx = env._sorting_index(env.current_state()).mean().item()
 
-        print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f}")
+        print(f"[{update:04d}] reward={mean_r:.4f} | energy={mean_e:.4f} | motion={mean_m:.4f} | sort_idx={sorting_idx:.6f}")
 
         if update % SAVE_CHECKPOINT_EVERY == 0:
             ckpt_path = f"checkpoints/ppo_{update:04d}.pt"
