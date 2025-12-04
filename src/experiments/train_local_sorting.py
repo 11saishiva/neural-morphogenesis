@@ -51,9 +51,9 @@
 
 #     if s.ndim == 2:
 #         N, C = s.shape
-#         img = s[:, 2 if C > 2 else 0].reshape(H, W)
+#         img = s[:, 2 if C > 2 else 0].contiguous().reshape(H, W)
 #     else:
-#         img = s.reshape(H, W)
+#         img = s.contiguous().reshape(H, W)
 
 #     img = img - img.min()
 #     if img.max() > 0:
@@ -100,7 +100,7 @@
 #         rew_buf, done_buf = [], []
 
 #         for t in range(T_STEPS):
-#             flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+#             flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
 
 #             with torch.no_grad():
 #                 a, logp, v, _, _ = policy.get_action_and_value(flat)
@@ -188,7 +188,7 @@
 #         # Diagnostics
 #         mean_r = rews.mean().item()
 #         mean_e = interfacial_energy(env.current_state()).mean().item()
-#         mean_m = motion_penalty(act_f.reshape(T, BATCH, N, ACTION_DIM).to(DEVICE).transpose(1,2)).mean().item()
+#         mean_m = motion_penalty(act_f.contiguous().reshape(T, BATCH, N, ACTION_DIM).to(DEVICE).transpose(1,2)).mean().item()
 
 #         rewards_hist.append(mean_r)
 #         energy_hist.append(mean_e)
@@ -297,21 +297,21 @@ def state_to_img(state):
         N, C = s.shape
         ch = 2 if C > 2 else 0
         try:
-            img = s[:, ch].reshape(H, W)
+            img = s[:, ch].contiguous().reshape(H, W)
         except Exception:
-            img = s.mean(axis=1).reshape(H, W)
+            img = s.mean(axis=1).contiguous().reshape(H, W)
     elif s.ndim == 1:
         if s.size == H * W:
-            img = s.reshape(H, W)
+            img = s.contiguous().reshape(H, W)
         else:
             side = int(math.sqrt(s.size))
             if side * side == s.size:
-                img = s.reshape(side, side)
+                img = s.contiguous().reshape(side, side)
             else:
                 flat = np.zeros(H * W, dtype=s.dtype)
                 length = min(s.size, H*W)
                 flat[:length] = s[:length]
-                img = flat.reshape(H, W)
+                img = flat.contiguous().reshape(H, W)
     elif s.ndim == 2 and s.shape[0] == H and s.shape[1] == W:
         img = s
     else:
@@ -333,10 +333,11 @@ def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
     frames = []
     patches, coords = env.reset(B=1, pA=0.5)
     for t in range(steps):
-        flat = patches.contiguous().reshape(BATCH * (env.H * env.W), 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
         with torch.no_grad():
-            a, _, _, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        act = a.reshape(BATCH, env.H * env.W, ACTION_DIM)
+            _, _, vals, _, _ = policy.get_action_and_value(flat, deterministic=True)
+
+        act = a.contiguous().reshape(BATCH, env.H * env.W, ACTION_DIM)
         if clamp_actions:
             act = act.clamp(-1.0, 1.0)
         (patches, coords), reward, _ = env.step(act)
@@ -411,12 +412,12 @@ def main():
                 mu_abs = a.abs().mean().item()
                 print(f"[UPDATE {update:04d} T{t}] action_mean_abs={mu_abs:.4f} policy_std_mean={current_std:.4f}")
 
-            act = a.reshape(BATCH, N, ACTION_DIM)
+            act = a.contiguous().reshape(BATCH, N, ACTION_DIM)
             # clamp actions to prevent runaway motion (diagnostic / safety). Keep if env expects [-1,1].
             act = act.clamp(-1.0, 1.0)
 
-            lp = logp.reshape(BATCH, N)
-            val = v.view(BATCH, N).mean(1)
+            lp = logp.contiguous().reshape(BATCH, N)
+            val = v.contiguous().reshape(BATCH, N).mean(1)
 
             (patches, coords), reward, _ = env.step(act)
 
@@ -431,7 +432,7 @@ def main():
         with torch.no_grad():
             flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
             _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
-        val_buf.append(v.view(BATCH, N).mean(1).cpu())
+        val_buf.append(v.contiguous().reshape(BATCH, N).mean(1).cpu())
 
         # stack buffers
         T = T_STEPS
@@ -447,11 +448,11 @@ def main():
 
         # flatten for ppo update
         S = T * BATCH * N
-        obs_f = obs.reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
-        act_f = acts.reshape(S, ACTION_DIM)
-        logp_f = logps.reshape(S)
-        ret_f = ret.unsqueeze(2).repeat(1,1,N).reshape(S)
-        adv_f = adv.unsqueeze(2).repeat(1,1,N).reshape(S)
+        obs_f = obs.contiguous().reshape(S, 4, PATCH_SIZE, PATCH_SIZE)
+        act_f = acts.contiguous().reshape(S, ACTION_DIM)
+        logp_f = logps.contiguous().reshape(S)
+        ret_f = ret.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
+        adv_f = adv.unsqueeze(2).repeat(1,1,N).contiguous().reshape(S)
 
         # normalize advantages (important)
         adv_f = adv_f.clone()
@@ -482,7 +483,7 @@ def main():
         mean_e = interfacial_energy(env.current_state()).mean().item()
         # motion penalty expects actions shaped like (B, A, H, W) or similar; reuse motion_penalty helper:
         try:
-            act_dev = act_f.reshape(T, BATCH, N, ACTION_DIM).to(DEVICE)
+            act_dev = act_f.contiguous().reshape(T, BATCH, N, ACTION_DIM).to(DEVICE)
             mean_m = motion_penalty(act_dev.transpose(1, 2)).mean().item()
         except Exception:
             # fallback: compute a simple action magnitude metric
