@@ -333,7 +333,7 @@ def deterministic_rollout_frames(env, policy, steps=64, clamp_actions=True):
     frames = []
     patches, coords = env.reset(B=1, pA=0.5)
     for t in range(steps):
-        flat = patches.reshape(BATCH * (env.H * env.W), 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+        flat = patches.contiguous().reshape(BATCH * (env.H * env.W), 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
         with torch.no_grad():
             a, _, _, _, _ = policy.get_action_and_value(flat, deterministic=True)
         act = a.reshape(BATCH, env.H * env.W, ACTION_DIM)
@@ -397,7 +397,7 @@ def main():
 
         # rollout
         for t in range(T_STEPS):
-            flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
 
             with torch.no_grad():
                 a, logp, v, _, _ = policy.get_action_and_value(flat)
@@ -429,7 +429,7 @@ def main():
 
         # bootstrap final value (deterministic)
         with torch.no_grad():
-            flat = patches.reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
+            flat = patches.contiguous().reshape(BATCH * N, 4, PATCH_SIZE, PATCH_SIZE).to(DEVICE)
             _, _, v, _, _ = policy.get_action_and_value(flat, deterministic=True)
         val_buf.append(v.view(BATCH, N).mean(1).cpu())
 
