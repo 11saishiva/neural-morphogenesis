@@ -150,7 +150,7 @@ class SortingEnv:
         self.reward_clip = 10.0
 
         # EMA smoothing for delta_sort — tiny alpha to keep signal directional
-        self.sort_ema_alpha = 0.10   # 0.1 is small but effective
+        self.sort_ema_alpha = 0.18   # 0.1 is small but effective
         self._sort_ema = None        # will be initialized in reset per-batch
         self._last_sort_idx = None   # store last sort_idx for delta computation
 
