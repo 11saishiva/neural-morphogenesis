@@ -189,7 +189,6 @@ Key points:
  - API unchanged: forward(...) -> (mu, value, fuzzy_feats)
    get_action_and_value(...) -> action, logp, value, mu, std
 """
-
 from typing import Callable, Tuple
 import math
 import torch
@@ -201,7 +200,6 @@ from torch.distributions import Normal
 def orthogonality_loss(fuzzy_feats: torch.Tensor) -> torch.Tensor:
     if fuzzy_feats.dim() != 2:
         fuzzy_feats = fuzzy_feats.view(fuzzy_feats.size(0), -1)
-    # use normalized gram for stability
     gram = fuzzy_feats.t() @ fuzzy_feats
     I = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
     gram = gram / (fuzzy_feats.size(0) + 1e-6)
@@ -259,7 +257,7 @@ class NeuroFuzzyActorCritic(nn.Module):
         self.n_rules = n_rules
         self.action_dim = action_dim
 
-        # Encoder: avoid inplace ReLU
+        # Encoder (avoid inplace operations)
         self.encoder_conv = nn.Sequential(
             nn.Conv2d(in_ch, 32, kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=False),
@@ -273,9 +271,8 @@ class NeuroFuzzyActorCritic(nn.Module):
             nn.ReLU(inplace=False),
         )
 
-        # fuzzy membership params (learnable)
+        # fuzzy membership params
         self.mf_centers = nn.Parameter(torch.randn(fuzzy_features, n_mfs) * 0.1)
-        # store log-scales to ensure positivity via exp()
         self._mf_logscales = nn.Parameter(torch.zeros(fuzzy_features, n_mfs) + math.log(0.5))
 
         # rule mask (learnable)
@@ -286,10 +283,10 @@ class NeuroFuzzyActorCritic(nn.Module):
         self.value_head = nn.Linear(n_rules, 1)
         self.aux_head = nn.Linear(n_rules, 4)
 
-        # keep a raw_logstd parameter and expose logstd via a property (no in-place sync)
-        self.raw_logstd = nn.Parameter(torch.zeros(action_dim) - 2.0)  # small initial std
+        # raw_logstd param used to produce a positive std via softplus
+        self.raw_logstd = nn.Parameter(torch.zeros(action_dim) - 2.0)
 
-        # metric extractor (callable)
+        # metric extractor
         self.patches_to_metrics: Callable[[torch.Tensor], torch.Tensor] = patches_to_metrics_default
 
         self._init_weights()
@@ -305,12 +302,15 @@ class NeuroFuzzyActorCritic(nn.Module):
 
     @property
     def logstd(self) -> torch.Tensor:
-        # expose logstd as a tensor derived from raw_logstd
+        """
+        Expose log(std) tensor (so .exp() gives std). This mirrors older code expectations:
+           policy.logstd.exp() -> std
+        """
         std = F.softplus(self.raw_logstd) + 1e-6
         return torch.log(std)
 
     def encode(self, patches: torch.Tensor) -> torch.Tensor:
-        # be defensive: trainer may pass a non-contiguous view; make contiguous
+        # ensure contiguous input (copy if necessary)
         if not patches.is_contiguous():
             patches = patches.contiguous()
         h = self.encoder_conv(patches)
@@ -320,7 +320,6 @@ class NeuroFuzzyActorCritic(nn.Module):
         return feats
 
     def fuzzy_forward(self, feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # feats: (B, feat_dim)
         B = feats.size(0)
         if feats.size(1) < self.fuzzy_features:
             pad = feats.new_zeros((B, self.fuzzy_features - feats.size(1)))
@@ -328,29 +327,24 @@ class NeuroFuzzyActorCritic(nn.Module):
         else:
             f = feats[:, : self.fuzzy_features]
 
-        # compute gaussian-like memberships safely (no in-place)
         f_exp = f.unsqueeze(-1)  # (B, F, 1)
         centers = self.mf_centers.unsqueeze(0)  # (1, F, n_mfs)
-        scales = (self._mf_logscales.exp()).unsqueeze(0)  # positive scales (1, F, n_mfs)
+        scales = (self._mf_logscales.exp()).unsqueeze(0)  # (1, F, n_mfs)
 
         diff = f_exp - centers  # (B, F, n_mfs)
         denom = 2.0 * (scales ** 2 + 1e-9)
         mvals = torch.exp(- (diff ** 2) / denom)  # (B, F, n_mfs)
 
-        # soft weights across membership functions to stabilize values
-        weights = F.softmax(mvals, dim=-1)  # (B, F, n_mfs)
-
-        # produce fuzzy features by weighted average of centers -> (B, F)
+        weights = F.softmax(mvals, dim=-1)
         fuzzy_feats = (weights * centers).sum(dim=-1)
 
-        # rules: linear projection from fuzzy features -> rules
         rule_raw = fuzzy_feats @ self.rule_masks.t()  # (B, n_rules)
-        rule_act = F.softplus(rule_raw)  # stable positive activations
+        rule_act = F.softplus(rule_raw)
 
         return rule_act, fuzzy_feats
 
     def forward(self, patches: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # make a safe contiguous copy of patches (cheap relative to training)
+        # expect patches shape (B, C, H, W)
         if not patches.is_contiguous():
             patches = patches.contiguous()
         feats = self.encode(patches)
@@ -359,7 +353,7 @@ class NeuroFuzzyActorCritic(nn.Module):
         mu = self.actor_head(rule_out)
         value = self.value_head(rule_out)
 
-        # ensure outputs are contiguous (safer for downstream .view/.reshape)
+        # ensure contiguity for downstream operations
         if not mu.is_contiguous():
             mu = mu.contiguous()
         if not value.is_contiguous():
@@ -370,13 +364,11 @@ class NeuroFuzzyActorCritic(nn.Module):
         return mu, value, fuzzy_feats
 
     def get_action_and_value(self, patches: torch.Tensor, deterministic: bool = False):
-        # ensure contiguous input
         if not patches.is_contiguous():
             patches = patches.contiguous()
 
         mu, value, fuzzy_feats = self.forward(patches)
 
-        # produce positive std from raw_logstd (no in-place)
         std_scalar = F.softplus(self.raw_logstd) + 1e-6
         std = std_scalar.unsqueeze(0).expand(mu.size(0), -1).contiguous()
 
@@ -389,7 +381,6 @@ class NeuroFuzzyActorCritic(nn.Module):
 
         logp = dist.log_prob(action).sum(dim=-1)
 
-        # ensure contiguity for outputs
         if not action.is_contiguous():
             action = action.contiguous()
         if not logp.is_contiguous():
