@@ -6,11 +6,8 @@
 
 # class SortingEnv:
 #     """
-#     Cell-sorting environment with both global and local (5x5x4) observation modes.
-
-#     Modes:
-#       - 'global': returns full grid state (B,5,H,W)
-#       - 'local': returns per-cell patches (B,N,4,5,5) + coords
+#     Cell-sorting environment with 'global' or 'local' observation modes.
+#     Local observations: (B, N, C, p, p) where N = H*W.
 #     """
 
 #     def __init__(self, H=64, W=64, device='cpu', gamma_motion=0.1,
@@ -23,7 +20,6 @@
 #         self.dca = DCA().to(self.device)
 #         self.state = None
 
-#     # ----- state initialization -----
 #     def _make_morphogen(self, B):
 #         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
 #         return x
@@ -38,78 +34,76 @@
 #         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
 #         morphogen = self._make_morphogen(B)
 #         center = torch.ones(B, 1, self.H, self.W, device=self.device)
-#         # build state and immediately detach/clone to prevent autograd tracking
+
 #         state = torch.cat([types, adhesion, morphogen, center], dim=1)
+#         # detach to prevent accidental autograd from environment state
 #         self.state = state.detach().clone()
 #         return self.get_observation()
 
-#     # ----- observation retrieval -----
 #     def get_observation(self):
-#         """
-#         Depending on mode:
-#           - global: returns full grid state (detached clone)
-#           - local: returns (patches, coords) computed from detached clone
-#         """
 #         if self.obs_mode == 'global':
 #             return self.state.detach().clone()
 #         elif self.obs_mode == 'local':
-#             # call extract_local_patches on a detached clone to be safe
+#             # extract_local_patches expects a (B,C,H,W) tensor and returns (B,N,C,p,p)
 #             patches, coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
 #             return patches, coords
 #         else:
 #             raise ValueError("obs_mode must be 'global' or 'local'")
 
-#     # ----- stepping the environment -----
+#     def _sorting_index(self, state):
+#         """
+#         Sorting index: |mean(A_left) - mean(A_right)| (per-batch)
+#         state: (B,C,H,W)
+#         returns: (B,)
+#         """
+#         A = state[:, TYPE_A]  # (B,H,W)
+#         mid = self.W // 2
+#         left = A[:, :, :mid].mean(dim=[1,2])
+#         right = A[:, :, mid:].mean(dim=[1,2])
+#         return torch.abs(left - right)
+
 #     def step(self, actions):
 #         """
 #         actions:
-#           - if global mode: tensor (B,3,H,W)
-#           - if local mode: per-cell actions (B,N,3) that will be reshaped to grid
-#         Returns:
-#           observation, reward (detached), info (cpu tensors)
+#           - local mode: (B, N, A)  -> reshaped to (B, A, H, W)
+#           - global mode: (B, A, H, W)
+#         Returns (observation, reward (detached), info dict with cpu tensors)
 #         """
-#         # defensive checks
 #         if self.state is None:
-#             raise RuntimeError("Environment not reset. Call reset() before step().")
+#             raise RuntimeError("Call reset() before step().")
 
 #         B = self.state.shape[0]
 
 #         if self.obs_mode == 'local':
-#             # reshape per-cell actions to grid (B,3,H,W)
 #             N = self.H * self.W
-#             assert actions.shape[1] == N, f"expected actions second dim {N}, got {actions.shape[1]}"
-#             # actions expected (B, N, A) -> transpose to (B, A, H, W)
-#             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
+#             if actions.dim() != 3 or actions.shape[1] != N:
+#                 raise ValueError(f"Expected local actions shape (B, N, A). Got {actions.shape}")
+#             # reshape to (B, A, H, W)
+#             actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
 
-#         # Run environment dynamics under no_grad so env ops don't create graph
+#         # run dynamics in no_grad to avoid building graph
 #         with torch.no_grad():
 #             s = self.state
 #             for _ in range(self.steps_per_action):
-#                 # dca may modify or return new tensor; keep return and then detach/clone
 #                 s = self.dca(s, actions, steps=1)
-#             # ensure any underlying storage is detached and independent
 #             self.state = s.detach().clone()
 
-#             # compute metrics using detached tensors
 #             e = interfacial_energy(self.state).detach()
 #             mpen = motion_penalty(actions.detach()).detach()
 
+#             # optional shaping: sorting index (small positive reward) can be added externally
 #             reward = -(e + self.gamma_motion * mpen)
-#             # info should be CPU tensors for logging
+
 #             info = {
 #                 "interfacial_energy": e.cpu(),
-#                 "motion_penalty": mpen.cpu()
+#                 "motion_penalty": mpen.cpu(),
 #             }
 
-#         # return safe (detached) observation and reward
 #         return self.get_observation(), reward.detach(), info
 
-#     # ----- utility -----
 #     def current_state(self):
-#         """Return a detached copy of the full grid state (B,5,H,W)."""
 #         return self.state.detach().clone()
 
-# src/envs/wrappers.py
 import torch
 import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
@@ -130,6 +124,16 @@ class SortingEnv:
         self.obs_mode = obs_mode
         self.dca = DCA().to(self.device)
         self.state = None
+
+        # Reward shaping coefficients (tuned for stronger learning signal)
+        # sort_weight gives positive reward for moving A toward left/right separation
+        self.sort_weight = 1.0
+        # penalize interfacial energy more strongly (encourages clustering)
+        self.energy_weight = 10.0
+        # motion penalty scale (keep moderate)
+        self.motion_weight = 1.0
+        # clip rewards for numerical stability
+        self.reward_clip = 10.0
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -197,17 +201,25 @@ class SortingEnv:
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
+            # detach snapshot after dynamics
             self.state = s.detach().clone()
 
-            e = interfacial_energy(self.state).detach()
-            mpen = motion_penalty(actions.detach()).detach()
+            # compute metrics using detached tensors
+            e = interfacial_energy(self.state).detach()      # (B,)
+            mpen = motion_penalty(actions.detach()).detach() # (B,)
+            sort_idx = self._sorting_index(self.state).detach() # (B,)
 
-            # optional shaping: sorting index (small positive reward) can be added externally
-            reward = -(e + self.gamma_motion * mpen)
+            # Reward: positive for sorting progress, negative for energy & motion.
+            # Multiply by weights tuned to give visible learning signal.
+            reward = (self.sort_weight * sort_idx) - (self.energy_weight * e) - (self.motion_weight * mpen)
+
+            # clip for safety
+            reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
             info = {
                 "interfacial_energy": e.cpu(),
                 "motion_penalty": mpen.cpu(),
+                "sort_index": sort_idx.cpu()
             }
 
         return self.get_observation(), reward.detach(), info
