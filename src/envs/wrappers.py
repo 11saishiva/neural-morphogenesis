@@ -142,13 +142,14 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # Reward shaping coefficients (tuned for stronger learning signal)
+               # Reward shaping coefficients (tuned for stronger learning signal)
         # We'll reward *progress* in sorting (delta of sort_index).
-        # Because sort_index is small in absolute value, we scale the delta.
-        self.sort_weight = 1000.0    # scale applied to delta(sort_idx)
-        self.energy_weight = 10.0    # penalize interfacial energy
-        self.motion_weight = 1.0     # motion penalty scale
-        self.reward_clip = 10.0      # clip rewards for safety
+        # Because sort_index and delta are very small, we scale aggressively but safely.
+        self.sort_weight = 1e5      # scale applied to delta(sort_idx) — large so tiny deltas matter
+        self.sort_bonus = 2000.0    # additional small bonus proportional to current sort_idx
+        self.energy_weight = 1.0    # penalize interfacial energy (reduced)
+        self.motion_weight = 0.5    # motion penalty scale (reduced to allow exploration)
+        self.reward_clip = 20.0     # clip rewards for safety (a bit larger than before)
 
         # track last sort index per-batch so we can reward progress
         self._last_sort_idx = None
@@ -244,11 +245,13 @@ class SortingEnv:
             # update last_sort_idx for next step
             self._last_sort_idx = sort_idx.clone()
 
-            # Reward: reward progress (delta), penalize energy & motion
-            reward = (self.sort_weight * delta_sort) - (self.energy_weight * e) - (self.motion_weight * mpen)
+                        # Reward: reward progress (delta), small bonus for current sort, penalize energy & motion
+            reward = (self.sort_weight * delta_sort) + (self.sort_bonus * sort_idx) \
+                     - (self.energy_weight * e) - (self.motion_weight * mpen)
 
             # clip for safety
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
+
 
             info = {
                 "interfacial_energy": e.cpu(),
