@@ -142,13 +142,17 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-                       # Reward shaping coefficients — safer/rescaled
-        # Reward only positive progress (use relu on delta), avoid punishing tiny regressions.
-        self.sort_weight = 1e4      # lowered from 1e5 -> still large but safer
-        self.sort_bonus = 500.0     # lowered from 2000 -> steady cumulative incentive
-        self.energy_weight = 1.0    # keep small energy penalty
-        self.motion_weight = 0.6    # slightly increased to discourage excessive motion
-        self.reward_clip = 10.0     # tighter clip to prevent huge spikes
+                             # Reward shaping coefficients (kept safe)
+        self.sort_weight = 1e4      # as applied earlier
+        self.sort_bonus = 800.0     # small bump from 500 -> rewards steady configurations
+        self.energy_weight = 1.0
+        self.motion_weight = 0.6
+        self.reward_clip = 10.0
+
+        # EMA smoothing for delta_sort — tiny alpha to keep signal directional
+        self.sort_ema_alpha = 0.10   # 0.1 is small but effective
+        self._sort_ema = None        # will be initialized in reset per-batch
+        self._last_sort_idx = None   # store last sort_idx for delta computation
 
         # track last sort index per-batch so we can reward progress
         self._last_sort_idx = None
@@ -171,6 +175,12 @@ class SortingEnv:
         state = torch.cat([types, adhesion, morphogen, center], dim=1)
         # detach to prevent accidental autograd from environment state
         self.state = state.detach().clone()
+                # initialize per-batch bookkeeping for sorting EMA and last sort index
+        B_actual = state.shape[0]
+        self._sort_ema = torch.zeros(B_actual, device=self.device)
+        # set last_sort_idx to current sorting index so first delta is zero
+        self._last_sort_idx = self._sorting_index(self.state).detach().clone()
+
 
         # initialize last_sort_idx to the current sorting index (detached)
         with torch.no_grad():
@@ -232,30 +242,35 @@ class SortingEnv:
             # compute metrics using detached tensors
             e = interfacial_energy(self.state).detach()      # (B,)
             mpen = motion_penalty(actions.detach()).detach() # (B,)
-            sort_idx = self._sorting_index(self.state).detach() # (B,)
+                        # compute current sorting index (B,)
+            sort_idx = self._sorting_index(self.state).detach()
 
-            # compute delta sort index (progress) per-batch
+            # compute per-batch raw delta (current - last)
             if self._last_sort_idx is None:
-                delta_sort = sort_idx.clone()
+                delta_sort = torch.zeros_like(sort_idx)
             else:
-                # both are tensors on same device
                 delta_sort = sort_idx - self._last_sort_idx
 
             # update last_sort_idx for next step
-            self._last_sort_idx = sort_idx.clone()
+            self._last_sort_idx = sort_idx.detach().clone()
 
-                                   # compute sorting index and delta (per-batch tensors expected)
-            # sort_idx: (B,), prev_sort_idx must be stored / computed — we assume delta_sort is available here.
-            # If delta_sort is negative, we do NOT penalize heavily: only reward positive progress.
-            # Safe positive-only progress signal:
-            pos_delta = torch.relu(delta_sort)   # zeroes-out negative changes
+            # initialize EMA if not present (safety)
+            if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
+                self._sort_ema = torch.zeros_like(sort_idx)
 
-            # Reward: encourage positive progress strongly, small bonus for current sort_idx,
-            # penalize energy & motion. Clip for numeric stability.
+            # EMA update (keeps signal directional and smooth)
+            alpha = float(self.sort_ema_alpha)
+            # move EMA to same device and dtype
+            self._sort_ema = (1.0 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
+
+            # positive-only smoothed delta
+            pos_delta = torch.relu(self._sort_ema)
+
+            # reward: strong encouragement for sustained positive progress + small bonus for current sort idx
             reward = (self.sort_weight * pos_delta) + (self.sort_bonus * sort_idx) \
                      - (self.energy_weight * e) - (self.motion_weight * mpen)
 
-            # clip per-batch for safety
+            # clip for stability
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
 
