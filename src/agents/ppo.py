@@ -255,11 +255,34 @@ def ppo_update(
             entropy = dist.entropy().sum(-1).mean()
 
             loss = actor_loss + value_loss - entropy_coef * entropy
+            backup_state = {k: v.clone() for k, v in policy.state_dict().items()}
+
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
             optimizer.step()
+            with torch.no_grad():
+                if hasattr(policy, "raw_logstd"):
+                # prevent extreme std values
+                policy.raw_logstd.clamp_(-10.0, 2.0)
+
+# detect NaNs in params; revert if found
+            nan_found = False
+            for p in policy.parameters():
+                if torch.isnan(p).any():
+                    nan_found = True
+                    break
+
+            if nan_found:
+                policy.load_state_dict(backup_state)
+                optimizer.zero_grad()
+    # Optional: reduce lr to be conservative
+                for g in optimizer.param_groups:
+                    g['lr'] = max(g.get('lr', 1e-6) * 0.5, 1e-8)
+                print("[ppo_update] NaN detected in parameters after optimizer.step(); reverted parameters and reduced LR.")
+    # skip logging this minibatch's stats (we reverted)
+                continue
 
             logs["actor_loss"] += actor_loss.item()
             logs["value_loss"] += value_loss.item()
