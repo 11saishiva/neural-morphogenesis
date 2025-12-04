@@ -254,9 +254,7 @@ class SortingEnv:
         left = A[:, :, :mid].mean(dim=[1,2])
         right = A[:, :, mid:].mean(dim=[1,2])
         return torch.abs(left - right)
-
-
-def step(self, actions):
+    def step(self, actions):
     """
     actions:
       - local mode: (B, N, A)  -> reshaped to (B, A, H, W)
@@ -264,98 +262,98 @@ def step(self, actions):
     Returns (observation, reward (detached), info dict with cpu tensors)
     """
 
-    if self.state is None:
+        if self.state is None:
         raise RuntimeError("Call reset() before step().")
 
-    B = self.state.shape[0]
+        B = self.state.shape[0]
 
-    if self.obs_mode == 'local':
-        N = self.H * self.W
-        if actions.dim() != 3 or actions.shape[1] != N:
-            raise ValueError(f"Expected local actions shape (B, N, A). Got {actions.shape}")
+        if self.obs_mode == 'local':
+            N = self.H * self.W
+            if actions.dim() != 3 or actions.shape[1] != N:
+                raise ValueError(f"Expected local actions shape (B, N, A). Got {actions.shape}")
         # reshape to (B, A, H, W)
-        actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
+            actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
 
     # ----------------------
     # Experiment toggles (tweak these on the env instance)
     # - keep defaults so baseline behavior remains intact
     # ----------------------
     # If True, reward uses sort_idx directly (stable) instead of noisy delta-based positive EMA only.
-    use_sort_idx_in_reward = getattr(self, "use_sort_idx_in_reward", False)
+        use_sort_idx_in_reward = getattr(self, "use_sort_idx_in_reward", False)
 
     # If True, apply EMA smoothing to delta_sort before using it.
-    enable_ema = getattr(self, "enable_sort_ema", False)
-    ema_alpha = float(getattr(self, "sort_ema_alpha", 0.05))  # small by default
+        enable_ema = getattr(self, "enable_sort_ema", False)
+        ema_alpha = float(getattr(self, "sort_ema_alpha", 0.05))  # small by default
 
     # If True, disable motion penalty term entirely (ablation).
-    disable_motion_penalty = getattr(self, "disable_motion_penalty", False)
+        disable_motion_penalty = getattr(self, "disable_motion_penalty", False)
 
     # If True, normalize each term (running mean/std) before weighted combination.
-    normalize_terms = getattr(self, "normalize_reward_terms", True)
-    norm_momentum = float(getattr(self, "norm_momentum", 0.99))
-    norm_eps = 1e-6
+        normalize_terms = getattr(self, "normalize_reward_terms", True)
+        norm_momentum = float(getattr(self, "norm_momentum", 0.99))
+        norm_eps = 1e-6
 
     # Optionally clip actions to prevent explosion (experiment).
-    if getattr(self, "clip_actions", False):
-        clip_val = float(getattr(self, "action_clip", 0.5))
-        actions = actions.clamp(-clip_val, clip_val)
+        if getattr(self, "clip_actions", False):
+            clip_val = float(getattr(self, "action_clip", 0.5))
+            actions = actions.clamp(-clip_val, clip_val)
 
     # run dynamics in no_grad to avoid building graph
-    with torch.no_grad():
-        s = self.state
-        for _ in range(self.steps_per_action):
-            s = self.dca(s, actions, steps=1)
+        with torch.no_grad():
+            s = self.state
+            for _ in range(self.steps_per_action):
+                s = self.dca(s, actions, steps=1)
         # detach snapshot after dynamics
-        self.state = s.detach().clone()
+            self.state = s.detach().clone()
 
         # compute metrics using detached tensors
-        e = interfacial_energy(self.state).detach()      # (B,)
-        mpen = motion_penalty(actions.detach()).detach() # (B,)
+            e = interfacial_energy(self.state).detach()      # (B,)
+            mpen = motion_penalty(actions.detach()).detach() # (B,)
 
         # compute current sorting index (B,)
-        sort_idx = self._sorting_index(self.state).detach()
+            sort_idx = self._sorting_index(self.state).detach()
 
         # compute per-batch raw delta (current - last)
-        if self._last_sort_idx is None:
-            delta_sort = torch.zeros_like(sort_idx)
-        else:
-            delta_sort = sort_idx - self._last_sort_idx
+            if self._last_sort_idx is None:
+                delta_sort = torch.zeros_like(sort_idx)
+            else:
+                delta_sort = sort_idx - self._last_sort_idx
 
         # update last_sort_idx for next step
-        self._last_sort_idx = sort_idx.detach().clone()
+            self._last_sort_idx = sort_idx.detach().clone()
 
         # ----------------------
         # EMA smoothing (optional) - on delta_sort
         # ----------------------
-        if enable_ema:
+            if enable_ema:
             # initialize EMA if not present or batch size changed
-            if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
-                self._sort_ema = torch.zeros_like(sort_idx, device=sort_idx.device, dtype=sort_idx.dtype)
+                if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
+                    self._sort_ema = torch.zeros_like(sort_idx, device=sort_idx.device, dtype=sort_idx.dtype)
             # ensure same device/dtype
-            self._sort_ema = ((1.0 - ema_alpha) * self._sort_ema.to(sort_idx.device) +
-                              ema_alpha * delta_sort)
-            smoothed_delta = self._sort_ema
-        else:
+                self._sort_ema = ((1.0 - ema_alpha) * self._sort_ema.to(sort_idx.device) +
+                                  ema_alpha * delta_sort)
+                smoothed_delta = self._sort_ema
+            else:
             # make sure _sort_ema exists for diagnostics (but keep zeros if disabled)
-            if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
-                self._sort_ema = torch.zeros_like(sort_idx, device=sort_idx.device, dtype=sort_idx.dtype)
-            smoothed_delta = delta_sort
+                if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
+                    self._sort_ema = torch.zeros_like(sort_idx, device=sort_idx.device, dtype=sort_idx.dtype)
+                smoothed_delta = delta_sort
 
         # positive-only smoothed delta (for reward when using delta)
-        pos_delta = torch.relu(smoothed_delta)
+            pos_delta = torch.relu(smoothed_delta)
 
         # ----------------------
         # Running normalization (per-term running mean/std)
         # ----------------------
         # initialize running stats containers if absent
-        if not hasattr(self, "_reward_running"):
+            if not hasattr(self, "_reward_running"):
             # stored as dict of (mean, var) tensors on CPU by default
-            self._reward_running = {
-                "sort_idx": {"mean": torch.zeros(1), "var": torch.ones(1)},
-                "delta":    {"mean": torch.zeros(1), "var": torch.ones(1)},
-                "energy":   {"mean": torch.zeros(1), "var": torch.ones(1)},
-                "motion":   {"mean": torch.zeros(1), "var": torch.ones(1)}
-            }
+                self._reward_running = {
+                    "sort_idx": {"mean": torch.zeros(1), "var": torch.ones(1)},
+                    "delta":    {"mean": torch.zeros(1), "var": torch.ones(1)},
+                    "energy":   {"mean": torch.zeros(1), "var": torch.ones(1)},
+                    "motion":   {"mean": torch.zeros(1), "var": torch.ones(1)}
+                }
 
         def update_running(name, x):
             # x: (B,) tensor
@@ -448,6 +446,9 @@ def step(self, actions):
         # detach reward for RL algorithm (return CPU tensors in info)
         return_obs = self._get_observation()  # keep your existing observation builder
         return return_obs, reward.detach(), info
+
+
+
 
     def current_state(self):
         return self.state.detach().clone()
