@@ -145,7 +145,7 @@ class SortingEnv:
                              # Reward shaping coefficients (kept safe)
         self.sort_weight = 1e4      # as applied earlier
         self.sort_bonus = 800.0     # small bump from 500 -> rewards steady configurations
-        self.energy_weight = 1.0
+        self.energy_weight = 2.0
         self.motion_weight = 0.6
         self.reward_clip = 10.0
 
