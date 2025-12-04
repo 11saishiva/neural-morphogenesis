@@ -142,14 +142,13 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-               # Reward shaping coefficients (tuned for stronger learning signal)
-        # We'll reward *progress* in sorting (delta of sort_index).
-        # Because sort_index and delta are very small, we scale aggressively but safely.
-        self.sort_weight = 1e5      # scale applied to delta(sort_idx) — large so tiny deltas matter
-        self.sort_bonus = 2000.0    # additional small bonus proportional to current sort_idx
-        self.energy_weight = 1.0    # penalize interfacial energy (reduced)
-        self.motion_weight = 0.5    # motion penalty scale (reduced to allow exploration)
-        self.reward_clip = 20.0     # clip rewards for safety (a bit larger than before)
+                       # Reward shaping coefficients — safer/rescaled
+        # Reward only positive progress (use relu on delta), avoid punishing tiny regressions.
+        self.sort_weight = 1e4      # lowered from 1e5 -> still large but safer
+        self.sort_bonus = 500.0     # lowered from 2000 -> steady cumulative incentive
+        self.energy_weight = 1.0    # keep small energy penalty
+        self.motion_weight = 0.6    # slightly increased to discourage excessive motion
+        self.reward_clip = 10.0     # tighter clip to prevent huge spikes
 
         # track last sort index per-batch so we can reward progress
         self._last_sort_idx = None
@@ -245,11 +244,18 @@ class SortingEnv:
             # update last_sort_idx for next step
             self._last_sort_idx = sort_idx.clone()
 
-                        # Reward: reward progress (delta), small bonus for current sort, penalize energy & motion
-            reward = (self.sort_weight * delta_sort) + (self.sort_bonus * sort_idx) \
+                                   # compute sorting index and delta (per-batch tensors expected)
+            # sort_idx: (B,), prev_sort_idx must be stored / computed — we assume delta_sort is available here.
+            # If delta_sort is negative, we do NOT penalize heavily: only reward positive progress.
+            # Safe positive-only progress signal:
+            pos_delta = torch.relu(delta_sort)   # zeroes-out negative changes
+
+            # Reward: encourage positive progress strongly, small bonus for current sort_idx,
+            # penalize energy & motion. Clip for numeric stability.
+            reward = (self.sort_weight * pos_delta) + (self.sort_bonus * sort_idx) \
                      - (self.energy_weight * e) - (self.motion_weight * mpen)
 
-            # clip for safety
+            # clip per-batch for safety
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
 
