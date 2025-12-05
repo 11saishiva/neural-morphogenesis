@@ -169,7 +169,6 @@ import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
 from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
-
 class SortingEnv:
     """
     Cell-sorting environment with 'global' or 'local' observation modes.
@@ -186,26 +185,31 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # Reward shaping coefficients — reduced/conservative defaults
-        # (originally very large; we normalize delta so these can be reasonable)
-        self.sort_weight = 100.0     # reduced from 1e4
-        self.sort_bonus = 50.0       # reduced from 800.0
+        # Reward shaping coefficients — reduced to avoid domination
+        # These are intentionally much smaller than before to prevent
+        # one-term dominance and huge spikes.
+        self.sort_weight = 1e3      # reduced from 1e4
+        self.sort_bonus = 80.0      # reduced from 800.0 (keeps linearity)
         self.energy_weight = 2.0
         self.motion_weight = 0.6
         self.reward_clip = 10.0
 
-        # EMA smoothing for delta_sort — tiny alpha to keep signal directional
-        self.sort_ema_alpha = 0.2   # keep small; controls smoothing of delta signal
+        # Per-term clipping (helps avoid single-step spikes)
+        self.term_clip = 5.0  # clip per-term contributions to [-term_clip, term_clip]
+
+        # EMA smoothing for delta_sort — tiny alpha to keep directional signal
+        self.sort_ema_alpha = 0.2   # small but effective
         self._sort_ema = None        # will be initialized in reset per-batch
         self._last_sort_idx = None   # store last sort_idx for delta computation
 
-        # Running scale (EMA) to normalize |delta_sort| so pos_delta is stable
-        # This prevents scale mismatch that caused spikes/instability
-        self.sort_scale_alpha = 0.01  # slow EMA to estimate typical delta magnitude
-        self._sort_scale_ema = None   # per-batch running scale (same shape as sort_idx)
+        # Running RMS normalizer for pos_delta (stabilizes scale)
+        # We maintain EMA of squared values to compute RMS.
+        self.pos_delta_rms_alpha = 0.01  # slow EMA (keeps scale stable across many steps)
+        self._pos_delta_rms = None       # initialized in reset per-batch
+        self._pos_delta_eps = 1e-6
 
     def _make_morphogen(self, B):
-        x = torch.linspace(0, 1, self.W, device=self.device).view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
+        x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
         return x
 
     def reset(self, B=1, pA=0.5):
@@ -227,15 +231,12 @@ class SortingEnv:
         B_actual = state.shape[0]
         self._sort_ema = torch.zeros(B_actual, device=self.device)
         # set last_sort_idx to current sorting index so first delta is zero
-        self._last_sort_idx = self._sorting_index(self.state).detach().clone()
-
-        # initialize running scale EMA for normalization (avoid division by zero later)
-        self._sort_scale_ema = torch.ones_like(self._last_sort_idx) * 1e-6
-
-        # double-check: compute current sort and store for clarity (detached)
         with torch.no_grad():
             cur_sort = self._sorting_index(self.state).detach()
             self._last_sort_idx = cur_sort.clone()
+
+        # initialize running RMS normalizer (per-batch)
+        self._pos_delta_rms = torch.ones(B_actual, device=self.device) * self._pos_delta_eps
 
         return self.get_observation()
 
@@ -257,9 +258,10 @@ class SortingEnv:
         """
         A = state[:, TYPE_A]  # (B,H,W)
         mid = self.W // 2
-        left = A[:, :, :mid].mean(dim=[1, 2])
-        right = A[:, :, mid:].mean(dim=[1, 2])
+        left = A[:, :, :mid].mean(dim=[1,2])
+        right = A[:, :, mid:].mean(dim=[1,2])
         return torch.abs(left - right)
+
 
     def step(self, actions):
         """
@@ -312,52 +314,64 @@ class SortingEnv:
             # move EMA to same device and dtype
             self._sort_ema = (1.0 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
 
-            # positive-only smoothed delta (signal to encourage)
+            # positive-only smoothed delta (still on device)
             pos_delta = torch.relu(self._sort_ema)
 
-            # --- Normalize pos_delta by a running EMA scale to avoid huge spikes ---
-            # initialize scale EMA if necessary
-            if self._sort_scale_ema is None or self._sort_scale_ema.shape[0] != sort_idx.shape[0]:
-                # small positive init to avoid division by zero
-                self._sort_scale_ema = torch.ones_like(sort_idx) * 1e-6
+            # ----- Running RMS normalization of pos_delta -----
+            # Maintain EMA of squared pos_delta and compute RMS scale.
+            if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
+                self._pos_delta_rms = torch.ones_like(pos_delta) * self._pos_delta_eps
 
-            # compute absolute magnitude to update running scale
-            abs_val = torch.abs(self._sort_ema)
-            beta = float(self.sort_scale_alpha)
-            # update per-batch running scale EMA (keeps device)
-            self._sort_scale_ema = (1.0 - beta) * self._sort_scale_ema.to(sort_idx.device) + beta * abs_val
+            beta = float(self.pos_delta_rms_alpha)
+            # update RMS EMA with squared pos_delta
+            sq = (pos_delta ** 2)
+            self._pos_delta_rms = (1.0 - beta) * self._pos_delta_rms.to(pos_delta.device) + beta * sq
+            # compute RMS (sqrt of EMA of squares)
+            running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
-            # normalize with a small epsilon for numerical safety
-            eps = 1e-8
-            normed_pos_delta = pos_delta / (self._sort_scale_ema + eps)
+            # normalized positive delta (scale-stable)
+            norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
-            # Optionally cap the normalized value to avoid runaway values
-            # (keeps reward stable if sudden one-off positive deltas)
-            max_norm = 10.0
-            normed_pos_delta = torch.clamp(normed_pos_delta, 0.0, max_norm)
+            # ----- Reward breakdown -----
+            # sort_term uses normalized pos_delta (so delta-driven rewards are scale-stable)
+            sort_term = self.sort_weight * norm_pos_delta
+            # small linear bonus based on current sort index (kept linear deliberately)
+            bonus_term = self.sort_bonus * sort_idx
 
-            # reward: use normalized smoothed delta contribution + linear sort bonus - penalties
-            reward_sort_term = self.sort_weight * normed_pos_delta
-            reward_bonus_term = self.sort_bonus * sort_idx   # keep linear (no sqrt)
-            reward = reward_sort_term + reward_bonus_term - (self.energy_weight * e) - (self.motion_weight * mpen)
+            # energy and motion penalties
+            energy_term = - (self.energy_weight * e)
+            motion_term = - (self.motion_weight * mpen)
 
-            # clip for stability
+            # Clip individual terms to avoid spikes (helps numerical stability)
+            sort_term = torch.clamp(sort_term, -self.term_clip, self.term_clip)
+            bonus_term = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
+            energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
+            motion_term = torch.clamp(motion_term, -self.term_clip, self.term_clip)
+
+            # combined reward
+            reward = sort_term + bonus_term + energy_term + motion_term
+
+            # final clipping for stability (keeps reward within reasonable range)
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
+            # build info with per-term contributions and diagnostics (cpu tensors)
             info = {
                 "interfacial_energy": e.cpu(),
                 "motion_penalty": mpen.cpu(),
                 "sort_index": sort_idx.cpu(),
                 "delta_sort_index": delta_sort.cpu(),
-                "sort_ema": self._sort_ema.cpu(),
-                "sort_scale": self._sort_scale_ema.cpu(),
+                "smoothed_delta": self._sort_ema.cpu(),
                 "pos_delta": pos_delta.cpu(),
-                "norm_pos_delta": normed_pos_delta.cpu(),
-                "reward_sort_term": reward_sort_term.cpu(),
-                "reward_bonus_term": reward_bonus_term.cpu()
+                "pos_delta_rms": self._pos_delta_rms.cpu(),
+                "running_scale": running_scale.cpu(),
+                "norm_pos_delta": norm_pos_delta.cpu(),
+                "sort_term": sort_term.cpu(),
+                "bonus_term": bonus_term.cpu(),
+                "energy_term": energy_term.cpu(),
+                "motion_term": motion_term.cpu(),
             }
 
         return self.get_observation(), reward.detach(), info
 
     def current_state(self):
-        return self.state.detach().clone() if self.state is not None else None
+        return self.state.detach().clone()
