@@ -185,24 +185,16 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # --- Tuned reward shaping coefficients (single focused change) ---
-        # Reduce motion_weight so motion penalty doesn't dominate.
-        # Increase sort_weight so normalized delta contributes meaningfully.
-        #
-        # Rationale:
-        #  - your logs show motion~0.32-0.35 => with previous motion_weight (0.6)
-        #    motion term ≈ 0.19 which overwhelms tiny sort signals (~1e-3..1e-4).
-        #  - by lowering motion_weight and raising sort_weight we restore a useful gradient.
-        #
-        # CHANGE: only these constants were adjusted from the prior file.
-        self.sort_weight = 2000.0     # modest increase (was 1e3 or previously 1e4 then reduced)
-        self.sort_bonus = 80.0        # keep linear small bonus (kept from previous change)
+        # --- Tuned reward shaping coefficients (focused change) ---
+        # Reduced sort weights and faster / safer RMS normalization initialization.
+        self.sort_weight = 800.0      # reduced from 2000 to damp spikes
+        self.sort_bonus = 40.0        # reduced linear bonus
         self.energy_weight = 2.0
-        self.motion_weight = 0.12     # substantial reduction from 0.6 -> lets sorting matter
+        self.motion_weight = 0.12     # kept reduced so motion doesn't drown signal
         self.reward_clip = 10.0
 
         # Per-term clipping (helps avoid single-step spikes)
-        self.term_clip = 5.0  # clip per-term contributions to [-term_clip, term_clip]
+        self.term_clip = 5.0  # keep a safety clamp
 
         # EMA smoothing for delta_sort — tiny alpha to keep directional signal
         self.sort_ema_alpha = 0.2   # small but effective
@@ -210,8 +202,8 @@ class SortingEnv:
         self._last_sort_idx = None   # store last sort_idx for delta computation
 
         # Running RMS normalizer for pos_delta (stabilizes scale)
-        # We maintain EMA of squared values to compute RMS.
-        self.pos_delta_rms_alpha = 0.01  # slow EMA (keeps scale stable across many steps)
+        # Increase alpha for faster adaptation and initialize RMS to 1.0 (safe)
+        self.pos_delta_rms_alpha = 0.05  # faster EMA (was 0.01)
         self._pos_delta_rms = None       # initialized in reset per-batch
         self._pos_delta_eps = 1e-6
 
@@ -242,8 +234,8 @@ class SortingEnv:
             cur_sort = self._sorting_index(self.state).detach()
             self._last_sort_idx = cur_sort.clone()
 
-        # initialize running RMS normalizer (per-batch)
-        self._pos_delta_rms = torch.ones(B_actual, device=self.device) * self._pos_delta_eps
+        # initialize running RMS normalizer (per-batch) to a safe value (1.0)
+        self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
 
         return self.get_observation()
 
@@ -325,9 +317,9 @@ class SortingEnv:
             pos_delta = torch.relu(self._sort_ema)
 
             # ----- Running RMS normalization of pos_delta -----
-            # Maintain EMA of squared pos_delta and compute RMS scale.
             if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
-                self._pos_delta_rms = torch.ones_like(pos_delta) * self._pos_delta_eps
+                # safe fallback init
+                self._pos_delta_rms = torch.ones_like(pos_delta) * 1.0
 
             beta = float(self.pos_delta_rms_alpha)
             # update RMS EMA with squared pos_delta
@@ -340,12 +332,8 @@ class SortingEnv:
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
             # ----- Reward breakdown -----
-            # sort_term uses normalized pos_delta (so delta-driven rewards are scale-stable)
             sort_term = self.sort_weight * norm_pos_delta
-            # small linear bonus based on current sort index (kept linear deliberately)
             bonus_term = self.sort_bonus * sort_idx
-
-            # energy and motion penalties
             energy_term = - (self.energy_weight * e)
             motion_term = - (self.motion_weight * mpen)
 
