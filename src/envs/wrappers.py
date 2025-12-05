@@ -315,26 +315,34 @@ class SortingEnv:
             # - clamp normalized progress to [0, 1.0]
             # - slightly smaller effective sort_weight at use time
             # -------------------------------
-            eps = 1e-3                      # larger epsilon to avoid tiny denominators
-            beta = 0.05                     # respond reasonably early in training
-
+                        # -------------------------------
+            # Safer RMS normalization for pos_delta:
+            # - EMA of squares (RMS) for scale
+            # - slower beta, larger eps floor
+            # - clamp normalized progress to [0, 1.0]
+            # - reduce effective sort_weight
+            # -------------------------------
+            eps = 1e-2                      # larger safety floor
+            beta = 0.02                     # slower update for scale (less reactive)
+            
             # ensure _pos_delta_scale is present and on correct device
+            # Now _pos_delta_scale stores EMA of squared pos_delta (for RMS)
             if self._pos_delta_scale is None or self._pos_delta_scale.shape[0] != pos_delta.shape[0]:
                 self._pos_delta_scale = torch.zeros_like(pos_delta, device=pos_delta.device)
 
-            # update running scale with EMA of abs(pos_delta)
-            abs_pd = pos_delta.abs()
-            self._pos_delta_scale = (1.0 - beta) * self._pos_delta_scale.to(abs_pd.device) + beta * abs_pd
+            # update running EMA of squared pos_delta
+            sq_pd = pos_delta * pos_delta
+            self._pos_delta_scale = (1.0 - beta) * self._pos_delta_scale.to(sq_pd.device) + beta * sq_pd
 
-            scale = self._pos_delta_scale + eps
+            # RMS scale + eps floor
+            scale = torch.sqrt(self._pos_delta_scale.clamp(min=0.0)) + eps
 
             # normalized positive delta, clipped to [0, 1]
             norm_pos = pos_delta / scale
             norm_pos = torch.clamp(norm_pos, 0.0, 1.0)
 
-            # slightly reduce sort_weight when applying (keeps hyperparam but avoids domination)
-            # If you want to permanently change the hyperparam, set self.sort_weight lower upstream.
-            effective_sort_weight = float(self.sort_weight) * 0.5
+            # more conservative effective_sort_weight to prevent domination
+            effective_sort_weight = float(self.sort_weight) * 0.2
 
             # reward: normalized progress + linear sort bonus - penalties
             reward = (effective_sort_weight * norm_pos) + (self.sort_bonus * sort_idx) \
