@@ -169,47 +169,43 @@
 
 #     def current_state(self):
 #         return self.state.detach().clone()
-
+# src/envs/wrappers.py
 import torch
 import torch.nn.functional as F
-from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-#from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+from typing import Tuple
+
+# Use absolute imports so `PYTHONPATH=src` works reliably.
+from envs.dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
 from utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+
 
 class SortingEnv:
     """
     Cell-sorting environment with 'global' or 'local' observation modes.
 
-    Changes included:
-    - curriculum support in reset(use_curriculum=...)
-    - flexible local action shape handling (accepts (B,N) or (B,N,1))
-    - deterministic seeding support
-    - 'done' return (currently False always; API-compatible)
-    - progress-to-goal metric and helper setter
-    - robust info dictionary with CPU numpy values for easy logging
+    Local observations: (B, N, C, p, p) where N = H*W.
     """
 
-    def __init__(self, H=64, W=64, device='cpu', gamma_motion=0.1,
-                 steps_per_action=6, obs_mode='local',
-                 curriculum_prob=0.0, curriculum_bias=0.12,
-                 seed=None, goal_sort_idx=0.03):
+    def __init__(
+        self,
+        H: int = 64,
+        W: int = 64,
+        device: str = "cpu",
+        gamma_motion: float = 0.1,
+        steps_per_action: int = 1,  # lowered debug default (was 6)
+        obs_mode: str = "local",
+        debug: bool = False,
+    ):
         self.H, self.W = H, W
         self.device = torch.device(device)
         self.gamma_motion = gamma_motion
-        self.steps_per_action = steps_per_action
+        self.steps_per_action = int(steps_per_action)
         self.obs_mode = obs_mode
+        self.debug = bool(debug)
+
+        # instantiate DCA on the correct device
         self.dca = DCA().to(self.device)
         self.state = None
-
-        # Curriculum / goal
-        self.curriculum_prob = float(curriculum_prob)
-        self.curriculum_bias = float(curriculum_bias)
-        self.goal_sort_idx = float(goal_sort_idx)
-
-        # RNG for deterministic resets if requested
-        self._seed = None
-        if seed is not None:
-            self.seed(seed)
 
         # --- Tuned reward shaping coefficients (DECISIVE CHANGE) ---
         self.sort_weight = 1500.0
@@ -231,54 +227,18 @@ class SortingEnv:
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
-    def seed(self, seed):
-        """Set deterministic seed for torch (best-effort)."""
-        self._seed = int(seed)
-        torch.manual_seed(self._seed)
-
-    def set_goal_sort_idx(self, goal):
-        """Set a target sort index considered 'complete' for progress calculation."""
-        self.goal_sort_idx = float(goal)
-
-    def progress_percent(self, sort_idx):
-        """Return percent to goal in [0,1] for a tensor of shape (B,)."""
-        if self.goal_sort_idx <= 0:
-            return torch.zeros_like(sort_idx)
-        pct = (sort_idx / self.goal_sort_idx).clamp(min=0.0, max=1.0)
-        return pct
-
-    def _make_morphogen(self, B):
-        x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
+    def _make_morphogen(self, B: int) -> torch.Tensor:
+        # shape (B,1,H,W)
+        x = torch.linspace(0, 1, self.W, device=self.device).view(1, 1, 1, self.W)
+        x = x.repeat(B, 1, self.H, 1)
         return x
 
-    def reset(self, B=1, pA=0.5, use_curriculum=None):
-        """
-        Reset the environment.
-        - B: batch size
-        - pA: base left-type fraction (float between 0 and 1)
-        - use_curriculum: None (use curriculum_prob), True, or False
-        """
-        # Decide curriculum application
-        if use_curriculum is None:
-            apply_curriculum = (torch.rand(B) < self.curriculum_prob).to(torch.bool)
-        else:
-            apply_curriculum = torch.ones(B, dtype=torch.bool) if bool(use_curriculum) else torch.zeros(B, dtype=torch.bool)
-
+    def reset(self, B: int = 1, pA: float = 0.5):
+        # initialize types (B,2,H,W)
         types = torch.rand(B, 2, self.H, self.W, device=self.device)
         types = F.softmax(types, dim=1)
-
-        # compute per-sample pA with curriculum bias applied for samples where apply_curriculum is True
-        pA = float(pA)
-        # apply curriculum_bias where requested
-        pA_vec = torch.full((B,), pA, device=self.device, dtype=torch.float32)
-        if apply_curriculum.any():
-            # bump towards left (TYPE_A) by curriculum_bias, clip to [0,1]
-            pA_vec[apply_curriculum] = torch.clamp(pA_vec[apply_curriculum] + self.curriculum_bias, 0.0, 1.0)
-
-        # expand pA_vec to match shapes and apply similar mixing to types channels
-        # safe broadcast: multiply first channel, complement to second
-        types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA_vec.view(B,1,1)
-        types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1.0 - pA_vec).view(B,1,1)
+        types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
+        types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1 - pA)
         types = F.softmax(types, dim=1)
 
         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
@@ -286,10 +246,11 @@ class SortingEnv:
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
 
         state = torch.cat([types, adhesion, morphogen, center], dim=1)
+        # keep a detached clone as canonical state
         self.state = state.detach().clone()
 
         # initialize per-batch bookkeeping
-        B_actual = state.shape[0]
+        B_actual = self.state.shape[0]
         self._sort_ema = torch.zeros(B_actual, device=self.device)
         with torch.no_grad():
             cur_sort = self._sorting_index(self.state).detach()
@@ -298,53 +259,71 @@ class SortingEnv:
         # initialize RMS normalizer to a safe value (1.0)
         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
 
-        # Return observation
+        if self.debug:
+            print(
+                f"[env.reset] B={B_actual}, state.shape={self.state.shape}, "
+                f"initial_sort={self._last_sort_idx.cpu().tolist()}"
+            )
+
         return self.get_observation()
 
     def get_observation(self):
-        if self.obs_mode == 'global':
+        if self.obs_mode == "global":
             return self.state.detach().clone()
-        elif self.obs_mode == 'local':
-            patches_coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
-            # extract_local_patches may return (patches, coords) or patches only; handle both
-            if isinstance(patches_coords, tuple) or isinstance(patches_coords, list):
-                patches, coords = patches_coords
-                return patches, coords
-            else:
-                return patches_coords, None
+        elif self.obs_mode == "local":
+            patches, coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
+            return patches, coords
         else:
             raise ValueError("obs_mode must be 'global' or 'local'")
 
-    def _sorting_index(self, state):
-        # A: (B, H, W) after indexing channel TYPE_A
+    def _sorting_index(self, state: torch.Tensor) -> torch.Tensor:
+        # A = state[:, TYPE_A] with shape (B,H,W)
         A = state[:, TYPE_A]
         mid = self.W // 2
-        left = A[:, :, :mid].mean(dim=[1,2])
-        right = A[:, :, mid:].mean(dim=[1,2])
+        # left and right are (B,)
+        left = A[:, :, :mid].mean(dim=[1, 2])
+        right = A[:, :, mid:].mean(dim=[1, 2])
         return torch.abs(left - right)
 
-    def step(self, actions):
+    def step(self, actions: torch.Tensor) -> Tuple[object, torch.Tensor, dict]:
+        """
+        actions: either
+          - global: (B, A, H, W) already in env layout, or
+          - local: (B, N, A) where N = H*W (old format from your agent)
+        Returns (observation, reward_tensor(B,), info_dict)
+        """
+
         if self.state is None:
             raise RuntimeError("Call reset() before step().")
 
+        # ensure actions on our device
+        actions = actions.to(self.device)
+
         B = self.state.shape[0]
 
-        # Flexible action handling for 'local' observation mode
-        if self.obs_mode == 'local':
+        # handle local actions shape -> reshape to (B, A, H, W)
+        if self.obs_mode == "local":
             N = self.H * self.W
-            # Accept both (B, N) and (B, N, A)
-            if actions.dim() == 2 and actions.shape[0] == B and actions.shape[1] == N:
-                actions = actions.unsqueeze(-1)  # (B, N, 1)
-            if actions.dim() != 3 or actions.shape[1] != N:
-                raise ValueError(f"Expected local actions shape (B, N) or (B, N, A). Got {tuple(actions.shape)}.")
-            # Now convert to the internal (B, A, H, W) layout by transposing and reshaping
-            actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
+            if actions.dim() == 3 and actions.shape[1] == N:
+                # expected (B, N, A) -> transpose to (B, A, N)
+                actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
+            elif actions.dim() == 4:
+                # already a (B, A, H, W)
+                pass
+            else:
+                raise ValueError(f"Expected local actions shape (B, N, A) or (B, A, H, W). Got {actions.shape}")
 
-        # run dynamics for steps_per_action
+        # main env step: run DCA for steps_per_action iterations
         with torch.no_grad():
             s = self.state
-            for _ in range(self.steps_per_action):
+            # guard: if someone accidentally sets huge steps_per_action, cap logging
+            sp = max(1, int(self.steps_per_action))
+            for i in range(sp):
+                # use single-step DCA calls to keep control and allow prints when debug
+                if self.debug and (i % 10 == 0):
+                    print(f"[env.step] dca step {i+1}/{sp}")
                 s = self.dca(s, actions, steps=1)
+            # commit state
             self.state = s.detach().clone()
 
             # compute diagnostics
@@ -352,17 +331,18 @@ class SortingEnv:
             mpen = motion_penalty(actions.detach()).detach() # (B,)
             sort_idx = self._sorting_index(self.state).detach()
 
-            # delta_sort (compute before we update last)
             if self._last_sort_idx is None:
                 delta_sort = torch.zeros_like(sort_idx)
             else:
                 delta_sort = sort_idx - self._last_sort_idx
 
+            # keep last sort index
             self._last_sort_idx = sort_idx.detach().clone()
 
-            # EMA smoothing
+            # init sort_ema if needed
             if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
                 self._sort_ema = torch.zeros_like(sort_idx)
+
             alpha = float(self.sort_ema_alpha)
             self._sort_ema = (1.0 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
 
@@ -371,19 +351,21 @@ class SortingEnv:
             # Running RMS normalization
             if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
                 self._pos_delta_rms = torch.ones_like(pos_delta) * 1.0
+
             beta = float(self.pos_delta_rms_alpha)
             sq = (pos_delta ** 2)
             self._pos_delta_rms = (1.0 - beta) * self._pos_delta_rms.to(pos_delta.device) + beta * sq
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
+
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
-            # Reward computation
+            # Reward terms
             sort_term = self.sort_weight * norm_pos_delta
             bonus_term = self.sort_bonus * sort_idx
             energy_term = - (self.energy_weight * e)
             motion_term = - (self.motion_weight * mpen)
 
-            # Clip per-term
+            # Clip each term (per batch element)
             sort_term = torch.clamp(sort_term, -self.term_clip, self.term_clip)
             bonus_term = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
@@ -392,13 +374,7 @@ class SortingEnv:
             reward = sort_term + bonus_term + energy_term + motion_term
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
-            # Done flag (API-compatible); not implementing episode termination now => all False
-            done = torch.zeros(B, dtype=torch.bool, device=self.device)
-
-            # percent to goal metric
-            percent_to_goal = self.progress_percent(sort_idx)
-
-            # Prepare info with cpu numpy values for easy logging
+            # prepare info dictionary with cpu tensors (safe for printing/serialization)
             info = {
                 "interfacial_energy": e.cpu(),
                 "motion_penalty": mpen.cpu(),
@@ -413,12 +389,32 @@ class SortingEnv:
                 "bonus_term": bonus_term.cpu(),
                 "energy_term": energy_term.cpu(),
                 "motion_term": motion_term.cpu(),
-                "percent_to_goal": percent_to_goal.cpu(),
-                "goal_sort_idx": torch.tensor(self.goal_sort_idx),
             }
 
-        # Return: observation, reward (B,), done (B,) and info. Keep reward as float tensor.
-        return self.get_observation(), reward.detach(), done, info
+            if self.debug:
+                # print compact diagnostics
+                print(
+                    f"[env.step.debug] sort_idx mean={sort_idx.mean().item():.6f}, "
+                    f"reward mean={reward.mean().item():.6f}, energy mean={e.mean().item():.6f}"
+                )
+
+        return self.get_observation(), reward.detach(), info
 
     def current_state(self):
         return self.state.detach().clone()
+
+
+# Quick smoke demo if you execute this module directly (won't run when imported).
+if __name__ == "__main__":
+    # Only run demo if you explicitly want; toggle with this flag to avoid accidental long runs.
+    debug_demo = True
+    if debug_demo:
+        print("wrappers.py demo: creating small env and doing one step")
+        env = SortingEnv(H=32, W=32, device="cpu", steps_per_action=1, obs_mode="local", debug=True)
+        obs = env.reset(B=2)
+        # create a random action matching local obs format: (B, N, A). We'll assume A=1 channel
+        N = env.H * env.W
+        # Make a dummy action of zeros that will not cause big motion
+        dummy_actions = torch.zeros(2, N, 1, dtype=torch.float32)
+        obs2, reward, info = env.step(dummy_actions)
+        print("demo done:", reward, info["sort_index"])
