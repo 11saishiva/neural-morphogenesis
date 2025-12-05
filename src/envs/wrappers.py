@@ -175,7 +175,7 @@ import torch.nn.functional as F
 from typing import Tuple
 
 # Use absolute imports so `PYTHONPATH=src` works reliably.
-from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
+from envs.dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
 from utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
 
