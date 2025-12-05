@@ -10,10 +10,19 @@ import numpy as np
 import torch
 from statistics import mean
 from pprint import pprint
+# sanity_checks.py (top)
+import os, sys
+
+# add src/ parent directory to sys.path so package-style imports work
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))      # .../src/envs
+SRC_ROOT = os.path.abspath(os.path.join(THIS_DIR, '..'))   # .../src
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
+
 
 # adjust import path/name as needed
 # from yourpackage.wrappers import SortingEnv
-from wrappers import SortingEnv
+from envs.wrappers import SortingEnv
 
 torch.set_num_threads(1)
 
