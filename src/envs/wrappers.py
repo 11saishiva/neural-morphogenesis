@@ -213,8 +213,10 @@ class SortingEnv:
         self.sort_weight = 1500.0
         self.sort_bonus = 200.0
         self.energy_weight = 2.0
-        self.motion_weight = 0.08
-        self.reward_clip = 10.0
+        # self.motion_weight = 0.08
+        # self.reward_clip = 10.0
+        self.motion_weight = 0.005
+        self.reward_clip = 50.0
 
         # Per-term clipping
         self.term_clip = 3.0
@@ -332,6 +334,7 @@ class SortingEnv:
             e = interfacial_energy(self.state).detach()      # (B,)
             mpen = motion_penalty(actions.detach()).detach() # (B,)
             sort_idx = self._sorting_index(self.state).detach()
+            sort_idx = sort_idx * 1000.0
 
             if self._last_sort_idx is None:
                 delta_sort = torch.zeros_like(sort_idx)
