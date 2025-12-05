@@ -230,7 +230,7 @@ class SortingEnv:
         # --- Tuned reward shaping coefficients (DECISIVE CHANGE) ---
         # Increased incentives for sorting while keeping safeguards.
         self.sort_weight = 1500.0  # raised from 800.0 -> stronger reward for sustained delta
-        self.sort_bonus = 200.0  # raised from 40.0  -> stronger linear incentive for sort_idx
+        self.sort_bonus = 400.0  # raised from 200.0  -> stronger linear incentive for sort_idx
         self.energy_weight = 2.0
         self.motion_weight = 0.08  # reduced from 0.12 -> allow more movement/exploration
         self.reward_clip = 10.0
@@ -257,34 +257,37 @@ class SortingEnv:
         )
         return x
 
-    def reset_with_mild_cluster(self, B=1, pA=0.5, cluster_count=3, cluster_radius=4):
-        """
-        Create an initial state with `cluster_count` small patches where TYPE_A is
-        slightly overrepresented. This is intentionally simple and conservative:
-        it's meant to act as a weak curriculum seed, not a full domain shift.
-        """
-        # start with a normal random initialization
+    def reset_with_mild_cluster(self, B=1, pA=0.5, left_bias=0.1):
+    """
+    Curriculum version: gently bias TYPE_A to the left half and TYPE_B to the right.
+    This directly aligns with the sort_idx definition.
+    """
         types = torch.rand(B, 2, self.H, self.W, device=self.device)
         types = F.softmax(types, dim=1)
+
+    # Start from base pA / (1 - pA)
         types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
         types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1 - pA)
         types = F.softmax(types, dim=1)
 
-        # create clusters by boosting TYPE_A locally
-        for b in range(B):
-            for _ in range(cluster_count):
-                cy = random.randint(cluster_radius, self.H - cluster_radius - 1)
-                cx = random.randint(cluster_radius, self.W - cluster_radius - 1)
-                y = torch.arange(0, self.H, device=self.device).view(self.H, 1)
-                x = torch.arange(0, self.W, device=self.device).view(1, self.W)
-                dist2 = (y - cy) ** 2 + (x - cx) ** 2
-                mask = (dist2 <= (cluster_radius ** 2)).float()
-                # small boost to TYPE_A in that mask
-                types[b, TYPE_A] = types[b, TYPE_A] + 0.25 * mask
-                # renormalize the two-type channel
-                s = types[b, TYPE_A] + types[b, TYPE_B]
-                types[b, TYPE_A] = types[b, TYPE_A] / (s + 1e-12)
-                types[b, TYPE_B] = types[b, TYPE_B] / (s + 1e-12)
+        mid = self.W // 2
+        left_mask  = torch.zeros(self.H, self.W, device=self.device)
+        right_mask = torch.zeros_like(left_mask)
+        left_mask[:, :mid] = 1.0
+        right_mask[:, mid:] = 1.0
+
+    # Broadcast masks to batch
+        left_mask  = left_mask.unsqueeze(0)   # (1,H,W)
+        right_mask = right_mask.unsqueeze(0)  # (1,H,W)
+
+    # Slight left/right bias – keep it small so it's "mild"
+        types[:, TYPE_A] = types[:, TYPE_A] + left_bias  * left_mask
+        types[:, TYPE_B] = types[:, TYPE_B] + left_bias  * right_mask
+
+    # Renormalize the two-type channel
+        s = types[:, TYPE_A] + types[:, TYPE_B]
+        types[:, TYPE_A] = types[:, TYPE_A] / (s + 1e-12)
+        types[:, TYPE_B] = types[:, TYPE_B] / (s + 1e-12)
 
         adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
         morphogen = self._make_morphogen(B)
@@ -298,7 +301,7 @@ class SortingEnv:
         Reset with optional curriculum: for a fraction self.curriculum_prob of resets,
         a mildly clustered initial state is used to bootstrap sorting behaviour.
         """
-        use_curriculum = random.random() < self.curriculum_prob
+        use_curriculum = random.random() < self.curriculum_prob  # 0.2 by default
         if use_curriculum:
             state = self.reset_with_mild_cluster(B=B, pA=pA)
         else:
