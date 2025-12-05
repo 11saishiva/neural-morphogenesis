@@ -185,13 +185,20 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # Reward shaping coefficients — reduced to avoid domination
-        # These are intentionally much smaller than before to prevent
-        # one-term dominance and huge spikes.
-        self.sort_weight = 1e3      # reduced from 1e4
-        self.sort_bonus = 80.0      # reduced from 800.0 (keeps linearity)
+        # --- Tuned reward shaping coefficients (single focused change) ---
+        # Reduce motion_weight so motion penalty doesn't dominate.
+        # Increase sort_weight so normalized delta contributes meaningfully.
+        #
+        # Rationale:
+        #  - your logs show motion~0.32-0.35 => with previous motion_weight (0.6)
+        #    motion term ≈ 0.19 which overwhelms tiny sort signals (~1e-3..1e-4).
+        #  - by lowering motion_weight and raising sort_weight we restore a useful gradient.
+        #
+        # CHANGE: only these constants were adjusted from the prior file.
+        self.sort_weight = 2000.0     # modest increase (was 1e3 or previously 1e4 then reduced)
+        self.sort_bonus = 80.0        # keep linear small bonus (kept from previous change)
         self.energy_weight = 2.0
-        self.motion_weight = 0.6
+        self.motion_weight = 0.12     # substantial reduction from 0.6 -> lets sorting matter
         self.reward_clip = 10.0
 
         # Per-term clipping (helps avoid single-step spikes)
