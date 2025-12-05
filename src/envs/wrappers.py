@@ -173,7 +173,8 @@
 import torch
 import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+#from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+from utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
 class SortingEnv:
     """
