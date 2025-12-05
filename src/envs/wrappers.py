@@ -185,26 +185,25 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # --- Tuned reward shaping coefficients (focused change) ---
-        # Reduced sort weights and faster / safer RMS normalization initialization.
-        self.sort_weight = 800.0      # reduced from 2000 to damp spikes
-        self.sort_bonus = 40.0        # reduced linear bonus
+        # --- Tuned reward shaping coefficients (DECISIVE CHANGE) ---
+        # Increased incentives for sorting while keeping safeguards.
+        self.sort_weight = 1500.0      # raised from 800.0 -> stronger reward for sustained delta
+        self.sort_bonus = 200.0        # raised from 40.0  -> stronger linear incentive for sort_idx
         self.energy_weight = 2.0
-        self.motion_weight = 0.12     # kept reduced so motion doesn't drown signal
+        self.motion_weight = 0.08      # reduced from 0.12 -> allow more movement/exploration
         self.reward_clip = 10.0
 
         # Per-term clipping (helps avoid single-step spikes)
-        self.term_clip = 5.0  # keep a safety clamp
+        self.term_clip = 3.0  # tightened from 5.0 to keep per-term contributions bounded
 
-        # EMA smoothing for delta_sort — tiny alpha to keep directional signal
-        self.sort_ema_alpha = 0.2   # small but effective
-        self._sort_ema = None        # will be initialized in reset per-batch
-        self._last_sort_idx = None   # store last sort_idx for delta computation
+        # EMA smoothing for delta_sort — keeps directional signal
+        self.sort_ema_alpha = 0.2
+        self._sort_ema = None
+        self._last_sort_idx = None
 
-        # Running RMS normalizer for pos_delta (stabilizes scale)
-        # Increase alpha for faster adaptation and initialize RMS to 1.0 (safe)
-        self.pos_delta_rms_alpha = 0.05  # faster EMA (was 0.01)
-        self._pos_delta_rms = None       # initialized in reset per-batch
+        # Running RMS normalizer for pos_delta — faster adaptation but safe init
+        self.pos_delta_rms_alpha = 0.10  # increased from 0.05 -> adapt more quickly to signal
+        self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
     def _make_morphogen(self, B):
@@ -223,18 +222,16 @@ class SortingEnv:
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
 
         state = torch.cat([types, adhesion, morphogen, center], dim=1)
-        # detach to prevent accidental autograd from environment state
         self.state = state.detach().clone()
 
-        # initialize per-batch bookkeeping for sorting EMA and last sort index
+        # initialize per-batch bookkeeping
         B_actual = state.shape[0]
         self._sort_ema = torch.zeros(B_actual, device=self.device)
-        # set last_sort_idx to current sorting index so first delta is zero
         with torch.no_grad():
             cur_sort = self._sorting_index(self.state).detach()
             self._last_sort_idx = cur_sort.clone()
 
-        # initialize running RMS normalizer (per-batch) to a safe value (1.0)
+        # initialize RMS normalizer to a safe value (1.0)
         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
 
         return self.get_observation()
@@ -243,32 +240,19 @@ class SortingEnv:
         if self.obs_mode == 'global':
             return self.state.detach().clone()
         elif self.obs_mode == 'local':
-            # extract_local_patches expects a (B,C,H,W) tensor and returns (B,N,C,p,p)
             patches, coords = extract_local_patches(self.state.detach().clone(), patch_size=5)
             return patches, coords
         else:
             raise ValueError("obs_mode must be 'global' or 'local'")
 
     def _sorting_index(self, state):
-        """
-        Sorting index: |mean(A_left) - mean(A_right)| (per-batch)
-        state: (B,C,H,W)
-        returns: (B,)
-        """
         A = state[:, TYPE_A]  # (B,H,W)
         mid = self.W // 2
         left = A[:, :, :mid].mean(dim=[1,2])
         right = A[:, :, mid:].mean(dim=[1,2])
         return torch.abs(left - right)
 
-
     def step(self, actions):
-        """
-        actions:
-          - local mode: (B, N, A)  -> reshaped to (B, A, H, W)
-          - global mode: (B, A, H, W)
-        Returns (observation, reward (detached), info dict with cpu tensors)
-        """
         if self.state is None:
             raise RuntimeError("Call reset() before step().")
 
@@ -278,78 +262,59 @@ class SortingEnv:
             N = self.H * self.W
             if actions.dim() != 3 or actions.shape[1] != N:
                 raise ValueError(f"Expected local actions shape (B, N, A). Got {actions.shape}")
-            # reshape to (B, A, H, W)
             actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
 
-        # run dynamics in no_grad to avoid building graph
         with torch.no_grad():
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
-            # detach snapshot after dynamics
             self.state = s.detach().clone()
 
-            # compute metrics using detached tensors
             e = interfacial_energy(self.state).detach()      # (B,)
             mpen = motion_penalty(actions.detach()).detach() # (B,)
-            # compute current sorting index (B,)
             sort_idx = self._sorting_index(self.state).detach()
 
-            # compute per-batch raw delta (current - last)
             if self._last_sort_idx is None:
                 delta_sort = torch.zeros_like(sort_idx)
             else:
                 delta_sort = sort_idx - self._last_sort_idx
 
-            # update last_sort_idx for next step
             self._last_sort_idx = sort_idx.detach().clone()
 
-            # initialize EMA if not present (safety)
             if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
                 self._sort_ema = torch.zeros_like(sort_idx)
 
-            # EMA update (keeps signal directional and smooth)
             alpha = float(self.sort_ema_alpha)
-            # move EMA to same device and dtype
             self._sort_ema = (1.0 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
 
-            # positive-only smoothed delta (still on device)
             pos_delta = torch.relu(self._sort_ema)
 
-            # ----- Running RMS normalization of pos_delta -----
+            # Running RMS normalization
             if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
-                # safe fallback init
                 self._pos_delta_rms = torch.ones_like(pos_delta) * 1.0
 
             beta = float(self.pos_delta_rms_alpha)
-            # update RMS EMA with squared pos_delta
             sq = (pos_delta ** 2)
             self._pos_delta_rms = (1.0 - beta) * self._pos_delta_rms.to(pos_delta.device) + beta * sq
-            # compute RMS (sqrt of EMA of squares)
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
-            # normalized positive delta (scale-stable)
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
-            # ----- Reward breakdown -----
+            # Reward terms with the new stronger incentives
             sort_term = self.sort_weight * norm_pos_delta
             bonus_term = self.sort_bonus * sort_idx
             energy_term = - (self.energy_weight * e)
             motion_term = - (self.motion_weight * mpen)
 
-            # Clip individual terms to avoid spikes (helps numerical stability)
+            # Clip per-term
             sort_term = torch.clamp(sort_term, -self.term_clip, self.term_clip)
             bonus_term = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
             motion_term = torch.clamp(motion_term, -self.term_clip, self.term_clip)
 
-            # combined reward
             reward = sort_term + bonus_term + energy_term + motion_term
-
-            # final clipping for stability (keeps reward within reasonable range)
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
-            # build info with per-term contributions and diagnostics (cpu tensors)
             info = {
                 "interfacial_energy": e.cpu(),
                 "motion_penalty": mpen.cpu(),
