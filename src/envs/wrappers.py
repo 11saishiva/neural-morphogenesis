@@ -258,14 +258,14 @@ class SortingEnv:
         return x
 
     def reset_with_mild_cluster(self, B=1, pA=0.5, left_bias=0.1):
-    """
-    Curriculum version: gently bias TYPE_A to the left half and TYPE_B to the right.
-    This directly aligns with the sort_idx definition.
-    """
+        """
+        Curriculum version: gently bias TYPE_A to the left half and TYPE_B to the right.
+        This directly aligns with the sort_idx definition.
+        """
         types = torch.rand(B, 2, self.H, self.W, device=self.device)
         types = F.softmax(types, dim=1)
 
-    # Start from base pA / (1 - pA)
+        # Start from base pA / (1 - pA)
         types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
         types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1 - pA)
         types = F.softmax(types, dim=1)
@@ -276,15 +276,15 @@ class SortingEnv:
         left_mask[:, :mid] = 1.0
         right_mask[:, mid:] = 1.0
 
-    # Broadcast masks to batch
+        # Broadcast masks to batch
         left_mask  = left_mask.unsqueeze(0)   # (1,H,W)
         right_mask = right_mask.unsqueeze(0)  # (1,H,W)
 
-    # Slight left/right bias – keep it small so it's "mild"
+        # Slight left/right bias – keep it small so it's "mild"
         types[:, TYPE_A] = types[:, TYPE_A] + left_bias  * left_mask
         types[:, TYPE_B] = types[:, TYPE_B] + left_bias  * right_mask
 
-    # Renormalize the two-type channel
+        # Renormalize the two-type channel
         s = types[:, TYPE_A] + types[:, TYPE_B]
         types[:, TYPE_A] = types[:, TYPE_A] / (s + 1e-12)
         types[:, TYPE_B] = types[:, TYPE_B] / (s + 1e-12)
