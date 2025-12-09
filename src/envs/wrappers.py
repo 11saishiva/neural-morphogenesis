@@ -216,8 +216,8 @@ class SortingEnv:
         self.sort_bonus    = 40.0
         self.energy_weight = 1.0
         self.motion_weight = 0.03
-        self.reward_clip   = 5.0
-        self.term_clip     = 5.0
+        self.reward_clip   = 50.0
+        self.term_clip     = 50.0
 
         # EMA smoothing of delta_sort
         self.sort_ema_alpha = 0.2
