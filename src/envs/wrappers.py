@@ -344,6 +344,9 @@ class SortingEnv:
             motion_term = torch.clamp(motion_term, -self.term_clip, self.term_clip)
 
             reward = sort_term + bonus_term + energy_term + motion_term
+            # normalize by number of DCA steps applied per agent action
+            reward = reward / float(self.steps_per_action)
+
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
             info = {
