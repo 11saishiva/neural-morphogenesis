@@ -21,14 +21,16 @@
 
 #         # --- Tuned reward shaping coefficients (DECISIVE CHANGE) ---
 #         # Increased incentives for sorting while keeping safeguards.
-#         self.sort_weight = 1500.0      # raised from 800.0 -> stronger reward for sustained delta
-#         self.sort_bonus = 200.0        # raised from 40.0  -> stronger linear incentive for sort_idx
+#         self.sort_weight = 1500.0      # earlier tuning kept
+#         self.sort_bonus = 200.0
 #         self.energy_weight = 2.0
-#         self.motion_weight = 0.08      # reduced from 0.12 -> allow more movement/exploration
-#         self.reward_clip = 10.0
 
-#         # Per-term clipping (helps avoid single-step spikes)
-#         self.term_clip = 3.0  # tightened from 5.0 to keep per-term contributions bounded
+#         # --- CRITICAL CHANGE: make motion penalty soft so agent can explore ---
+#         self.motion_weight = 0.005     # reduced greatly so exploration isn't suppressed
+
+#         # Allow larger per-term contributions now that we amplify sort signal
+#         self.reward_clip = 50.0
+#         self.term_clip = 20.0
 
 #         # EMA smoothing for delta_sort — keeps directional signal
 #         self.sort_ema_alpha = 0.2
@@ -36,9 +38,12 @@
 #         self._last_sort_idx = None
 
 #         # Running RMS normalizer for pos_delta — faster adaptation but safe init
-#         self.pos_delta_rms_alpha = 0.10  # increased from 0.05 -> adapt more quickly to signal
+#         self.pos_delta_rms_alpha = 0.10
 #         self._pos_delta_rms = None
 #         self._pos_delta_eps = 1e-6
+
+#         # Amount to amplify the raw sorting index by (critical to provide usable signal)
+#         self.SORT_AMPLIFY = 1.0 #changed SORT_AMPLIFY from 1000 to 1
 
 #     def _make_morphogen(self, B):
 #         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -62,8 +67,10 @@
 #         B_actual = state.shape[0]
 #         self._sort_ema = torch.zeros(B_actual, device=self.device)
 #         with torch.no_grad():
-#             cur_sort = self._sorting_index(self.state).detach()
-#             self._last_sort_idx = cur_sort.clone()
+#             # compute raw sort index then store amplified last_sort
+#             raw_sort = self._sorting_index(self.state).detach()
+#             amp_sort = raw_sort * self.SORT_AMPLIFY
+#             self._last_sort_idx = amp_sort.clone()
 
 #         # initialize RMS normalizer to a safe value (1.0)
 #         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
@@ -106,13 +113,18 @@
 
 #             e = interfacial_energy(self.state).detach()      # (B,)
 #             mpen = motion_penalty(actions.detach()).detach() # (B,)
-#             sort_idx = self._sorting_index(self.state).detach()
+
+#             # compute raw sort index and amplified version for use in deltas/EMA
+#             raw_sort_idx = self._sorting_index(self.state).detach()
+#             sort_idx = raw_sort_idx * self.SORT_AMPLIFY  # AMPLIFIED (critical)
+#             # keep a copy of raw sort in info as well for debugging
 
 #             if self._last_sort_idx is None:
 #                 delta_sort = torch.zeros_like(sort_idx)
 #             else:
 #                 delta_sort = sort_idx - self._last_sort_idx
 
+#             # store last amplified sort idx
 #             self._last_sort_idx = sort_idx.detach().clone()
 
 #             if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
@@ -134,13 +146,13 @@
 
 #             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
-#             # Reward terms with the new stronger incentives
+#             # Reward terms with the stronger incentives but with relaxed clipping
 #             sort_term = self.sort_weight * norm_pos_delta
-#             bonus_term = self.sort_bonus * sort_idx
+#             bonus_term = self.sort_bonus * (raw_sort_idx)  # raw sort index is a sensible linear bonus
 #             energy_term = - (self.energy_weight * e)
 #             motion_term = - (self.motion_weight * mpen)
 
-#             # Clip per-term
+#             # Clip per-term (looser now to allow amplified sort signal)
 #             sort_term = torch.clamp(sort_term, -self.term_clip, self.term_clip)
 #             bonus_term = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
 #             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
@@ -152,7 +164,8 @@
 #             info = {
 #                 "interfacial_energy": e.cpu(),
 #                 "motion_penalty": mpen.cpu(),
-#                 "sort_index": sort_idx.cpu(),
+#                 "raw_sort_index": raw_sort_idx.cpu(),
+#                 "sort_index": sort_idx.cpu(),             # amplified sort index (used in delta)
 #                 "delta_sort_index": delta_sort.cpu(),
 #                 "smoothed_delta": self._sort_ema.cpu(),
 #                 "pos_delta": pos_delta.cpu(),
@@ -169,11 +182,7 @@
 
 #     def current_state(self):
 #         return self.state.detach().clone()
-# src/envs/wrappers.py
 
-# # Use absolute imports so `PYTHONPATH=src` works reliably.
-# from envs.dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-# from utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
 import torch
 import torch.nn.functional as F
@@ -196,28 +205,27 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # --- Tuned reward shaping coefficients (DECISIVE CHANGE) ---
-        # Increased incentives for sorting while keeping safeguards.
-        self.sort_weight = 1500.0      # earlier tuning kept
-        self.sort_bonus = 200.0
-        self.energy_weight = 2.0
+        # --- Reward shaping coefficients: conservative research defaults ---
+        # These balance learning signal and stability for research runs.
+        self.sort_weight   = 800.0     # conservative: earlier working magnitude
+        self.sort_bonus    = 40.0      # conservative bonus for sort index
+        self.energy_weight = 1.0       # energy penalty
+        self.motion_weight = 0.12      # penalize motion at a reasonable level
+        self.reward_clip   = 5.0       # overall clipping to avoid spikes
 
-        # --- CRITICAL CHANGE: make motion penalty soft so agent can explore ---
-        self.motion_weight = 0.005     # reduced greatly so exploration isn't suppressed
+        # Per-term clipping
+        self.term_clip = 5.0
 
-        # Allow larger per-term contributions now that we amplify sort signal
-        self.reward_clip = 50.0
-        self.term_clip = 20.0
-
-        # EMA smoothing for delta_sort — keeps directional signal
+        # EMA smoothing for delta_sort (keeps directional signal)
         self.sort_ema_alpha = 0.2
         self._sort_ema = None
         self._last_sort_idx = None
 
-        # Running RMS normalizer for pos_delta — faster adaptation but safe init
-        self.pos_delta_rms_alpha = 0.10
+        # Running RMS normalizer for pos_delta — safe init
+        self.pos_delta_rms_alpha = 0.05
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
+
 
         # Amount to amplify the raw sorting index by (critical to provide usable signal)
         self.SORT_AMPLIFY = 1.0 #changed SORT_AMPLIFY from 1000 to 1
