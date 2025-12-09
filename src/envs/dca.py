@@ -345,7 +345,8 @@ class DCA(nn.Module):
 
         # ★★★ APPLY MORPHOGEN SOFTENING HERE ★★★
         # reduces strength without breaking gradient flow
-        m = 0.5 * m
+        #  Previously: m = 0.5 * m
+        m = 0.8 * m
 
         state[:, MORPH:MORPH+1] = m
 
