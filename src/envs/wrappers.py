@@ -220,7 +220,7 @@ class SortingEnv:
         self._pos_delta_eps = 1e-6
 
         # Amount to amplify the raw sorting index by (critical to provide usable signal)
-        self.SORT_AMPLIFY = 1000.0
+        self.SORT_AMPLIFY = 1.0 #changed SORT_AMPLIFY from 1000 to 1
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
