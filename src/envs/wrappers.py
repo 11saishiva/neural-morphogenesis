@@ -281,7 +281,7 @@ class SortingEnv:
 
         # Amount to amplify the raw sorting index by (critical to provide usable signal)
         # Tuned to move raw sort (~1e-4) into a usable range without extreme spikes.
-        self.SORT_AMPLIFY = 4000.0
+        self.SORT_AMPLIFY = 5000.0
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -423,6 +423,20 @@ class SortingEnv:
                 "energy_term": energy_term.cpu(),
                 "motion_term": motion_term.cpu(),
             }
+            # diagnostic: print reward decomposition & contribution fractions
+            r = reward[0].detach().cpu().item()
+            sort_term_v = float(info["sort_term"][0].detach().cpu().item())
+            bonus_v     = float(info.get("bonus_term", torch.tensor([0.]))[0].detach().cpu().item())
+            energy_v    = float(info.get("energy_term", torch.tensor([0.]))[0].detach().cpu().item())
+            motion_v    = float(info.get("motion_term", torch.tensor([0.]))[0].detach().cpu().item())
+
+            total_abs = abs(sort_term_v) + abs(bonus_v) + abs(energy_v) + abs(motion_v) + 1e-9
+            print(f"R_total={r:.6f} | sort={sort_term_v:.6f} ({100*abs(sort_term_v)/total_abs:.1f}%) | bonus={bonus_v:.6f} ({100*abs(bonus_v)/total_abs:.1f}%) | energy={energy_v:.6f} ({100*abs(energy_v)/total_abs:.1f}%) | motion={motion_v:.6f} ({100*abs(motion_v)/total_abs:.1f}%)")
+            # Also helpful: raw sort index and running_scale
+            print("raw_sort_index:", float(info.get("raw_sort_index", torch.tensor([0.]))[0].cpu().item()),
+                  "sort_index(amplified):", float(info.get("sort_index", torch.tensor([0.]))[0].cpu().item()),
+                  "running_scale:", float(info.get("running_scale", torch.tensor([0.]))[0].cpu().item()))
+
 
             # DEBUG helper (disabled by default). Enable temporarily if you want
             # to print a single-example info dict for debugging:
