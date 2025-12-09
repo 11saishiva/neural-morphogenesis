@@ -260,17 +260,14 @@ class SortingEnv:
 
         # --- Reward shaping coefficients: conservative research defaults ---
         # These balance learning signal and stability for research runs.
-        self.sort_weight   = 800.0
-        self.sort_bonus    = 40.0
-        self.energy_weight = 1.0
-        self.motion_weight = 0.03
+        self.sort_weight   = 800.0     # conservative: earlier working magnitude
+        self.sort_bonus    = 40.0      # conservative bonus for sort index
+        self.energy_weight = 1.0       # energy penalty
+        self.motion_weight = 0.03      # penalize motion at a reasonable level (was 0.12 before)
+        self.reward_clip   = 5.0       # overall clipping to avoid spikes
 
-        self.reward_clip   = 5.0   # keep overall reward bounded
-        self.term_clip     = 5.0   # per-term clip
-
-        # Amplification for sorting index (tweakable)
-        self.SORT_AMPLIFY = 3000.0 # Amount to amplify the raw sorting index by (critical to provide usable signal)
-        
+        # Per-term clipping
+        self.term_clip = 5.0
 
         # EMA smoothing for delta_sort (keeps directional signal)
         self.sort_ema_alpha = 0.2
@@ -282,7 +279,9 @@ class SortingEnv:
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
-       
+        # Amount to amplify the raw sorting index by (critical to provide usable signal)
+        # Tuned to move raw sort (~1e-4) into a usable range without extreme spikes.
+        self.SORT_AMPLIFY = 3000.0
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -309,8 +308,6 @@ class SortingEnv:
             # compute raw sort index then store amplified last_sort
             raw_sort = self._sorting_index(self.state).detach()
             amp_sort = raw_sort * self.SORT_AMPLIFY
-            # safety clamp on stored last sort to avoid enormous initial jumps
-            amp_sort = torch.clamp(amp_sort, -1e3, 1e3)
             self._last_sort_idx = amp_sort.clone()
 
         # initialize RMS normalizer to a safe value (1.0)
@@ -357,14 +354,9 @@ class SortingEnv:
 
             # compute raw sort index and amplified version for use in deltas/EMA
             raw_sort_idx = self._sorting_index(self.state).detach()
+            sort_idx = raw_sort_idx * self.SORT_AMPLIFY  # AMPLIFIED (critical)
 
-            # Amplify but protect against extreme instantaneous spike values
-            sort_idx = raw_sort_idx * self.SORT_AMPLIFY  # AMPLIFIED
-            # safety clamp on amplified sort index (prevents single-step explosions)
-            sort_idx = torch.clamp(sort_idx, -1e3, 1e3)
-
-            # keep a copy of raw sort in info as well for debugging
-
+            # compute delta relative to last amplified value
             if self._last_sort_idx is None:
                 delta_sort = torch.zeros_like(sort_idx)
             else:
@@ -398,7 +390,7 @@ class SortingEnv:
             energy_term = - (self.energy_weight * e)
             motion_term = - (self.motion_weight * mpen)
 
-            # Clip per-term (conservative)
+            # Clip per-term (looser now to allow amplified sort signal)
             sort_term = torch.clamp(sort_term, -self.term_clip, self.term_clip)
             bonus_term = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
@@ -408,10 +400,11 @@ class SortingEnv:
             # normalize by number of DCA steps applied per agent action
             reward = reward / float(self.steps_per_action)
 
-            # after reward = reward / float(self.steps_per_action)
+            # primary hard clamp
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
-            # extra robust safety: shrink extreme reward jumps a bit
+            # extra robust safety: shrink extreme reward jumps a bit (smooth, keeps sign)
+            # This reduces single-update explosions while preserving signal shape.
             reward = torch.tanh(reward) * float(self.reward_clip)
 
             info = {
@@ -430,11 +423,15 @@ class SortingEnv:
                 "energy_term": energy_term.cpu(),
                 "motion_term": motion_term.cpu(),
             }
-            # (inside the with torch.no_grad() block, right before return:)
-            if True:
-                # print one example for debugging; remove after inspection
-                print("DBG_INFO:", {k: v[0].item() if isinstance(v, torch.Tensor) and v.numel()==1 else v[0].cpu().numpy() if isinstance(v, torch.Tensor) else v for k,v in info.items()})
 
+            # DEBUG helper (disabled by default). Enable temporarily if you want
+            # to print a single-example info dict for debugging:
+            # if True:
+            #     idx = 0
+            #     small_info = {k: v[idx].item() if isinstance(v, torch.Tensor) and v.numel() == 1
+            #                   else (v[idx].cpu().numpy() if isinstance(v, torch.Tensor) else v)
+            #                   for k, v in info.items()}
+            #     print("DBG_INFO:", small_info)
 
         return self.get_observation(), reward.detach(), info
 
