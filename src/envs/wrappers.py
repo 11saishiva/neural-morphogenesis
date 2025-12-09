@@ -281,7 +281,7 @@ class SortingEnv:
 
         # Amount to amplify the raw sorting index by (critical to provide usable signal)
         # Tuned to move raw sort (~1e-4) into a usable range without extreme spikes.
-        self.SORT_AMPLIFY = 3000.0
+        self.SORT_AMPLIFY = 4000.0
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -432,6 +432,26 @@ class SortingEnv:
             #                   else (v[idx].cpu().numpy() if isinstance(v, torch.Tensor) else v)
             #                   for k, v in info.items()}
             #     print("DBG_INFO:", small_info)
+            # Probe snippet — paste into your training script where env is available
+            obs = env.reset(B=1)            # or whatever batch size you normally use
+            actions = torch.zeros(1, env.H*env.W, device=env.device)  # trivial action to probe
+            obs2, reward, info = env.step(actions)
+            # Print the key scalars for the first batch element
+            print("probe -> reward:", float(reward[0].cpu().item()))
+            print("interfacial_energy:", float(info["interfacial_energy"][0].cpu().item()))
+            print("motion_penalty:", float(info["motion_penalty"][0].cpu().item()))
+            print("raw_sort_index (unamp):", float(info["raw_sort_index"][0].cpu().item()))
+            print("sort_index (amplified):", float(info["sort_index"][0].cpu().item()))
+            print("delta_sort_index:", float(info["delta_sort_index"][0].cpu().item()))
+            print("smoothed_delta:", float(info["smoothed_delta"][0].cpu().item()))
+            print("pos_delta:", float(info["pos_delta"][0].cpu().item()))
+            print("running_scale:", float(info["running_scale"][0].cpu().item()))
+            print("norm_pos_delta:", float(info["norm_pos_delta"][0].cpu().item()))
+            print("sort_term:", float(info["sort_term"][0].cpu().item()))
+            print("bonus_term:", float(info["bonus_term"][0].cpu().item()))
+            print("energy_term:", float(info["energy_term"][0].cpu().item()))
+            print("motion_term:", float(info["motion_term"][0].cpu().item()))
+
 
         return self.get_observation(), reward.detach(), info
 
