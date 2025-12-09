@@ -230,7 +230,7 @@ class SortingEnv:
         self._pos_delta_eps = 1e-6
 
         # Critical: scaling factor for sorting index
-        self.SORT_AMPLIFY = 1000.0   # your current research-default
+        self.SORT_AMPLIFY = 5000.0   # your current research-default
 
 
     # ---------------------------------------------------------
