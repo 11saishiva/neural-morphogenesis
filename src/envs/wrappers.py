@@ -210,7 +210,7 @@ class SortingEnv:
         self.sort_weight   = 800.0     # conservative: earlier working magnitude
         self.sort_bonus    = 40.0      # conservative bonus for sort index
         self.energy_weight = 1.0       # energy penalty
-        self.motion_weight = 0.12      # penalize motion at a reasonable level
+        self.motion_weight = 0.03      # penalize motion at a reasonable level(was 0.12 before)
         self.reward_clip   = 5.0       # overall clipping to avoid spikes
 
         # Per-term clipping
