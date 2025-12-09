@@ -260,14 +260,17 @@ class SortingEnv:
 
         # --- Reward shaping coefficients: conservative research defaults ---
         # These balance learning signal and stability for research runs.
-        self.sort_weight   = 800.0     # conservative: earlier working magnitude
-        self.sort_bonus    = 40.0      # conservative bonus for sort index
-        self.energy_weight = 1.0       # energy penalty
-        self.motion_weight = 0.03      # penalize motion at a reasonable level
-        self.reward_clip   = 5.0       # overall clipping to avoid spikes
+        self.sort_weight   = 800.0
+        self.sort_bonus    = 40.0
+        self.energy_weight = 1.0
+        self.motion_weight = 0.03
 
-        # Per-term clipping
-        self.term_clip = 5.0
+        self.reward_clip   = 5.0   # keep overall reward bounded
+        self.term_clip     = 5.0   # per-term clip
+
+        # Amplification for sorting index (tweakable)
+        self.SORT_AMPLIFY = 3000.0 # Amount to amplify the raw sorting index by (critical to provide usable signal)
+        
 
         # EMA smoothing for delta_sort (keeps directional signal)
         self.sort_ema_alpha = 0.2
@@ -279,9 +282,7 @@ class SortingEnv:
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
-        # Amount to amplify the raw sorting index by (critical to provide usable signal)
-        # Conservative value — increase to 3000/4000 if needed, decrease if you see spikes.
-        self.SORT_AMPLIFY = 2000.0
+       
 
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device).view(1,1,1,self.W).repeat(B,1,self.H,1)
@@ -407,7 +408,11 @@ class SortingEnv:
             # normalize by number of DCA steps applied per agent action
             reward = reward / float(self.steps_per_action)
 
+            # after reward = reward / float(self.steps_per_action)
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
+
+            # extra robust safety: shrink extreme reward jumps a bit
+            reward = torch.tanh(reward) * float(self.reward_clip)
 
             info = {
                 "interfacial_energy": e.cpu(),
@@ -425,6 +430,11 @@ class SortingEnv:
                 "energy_term": energy_term.cpu(),
                 "motion_term": motion_term.cpu(),
             }
+            # (inside the with torch.no_grad() block, right before return:)
+            if True:
+                # print one example for debugging; remove after inspection
+                print("DBG_INFO:", {k: v[0].item() if isinstance(v, torch.Tensor) and v.numel()==1 else v[0].cpu().numpy() if isinstance(v, torch.Tensor) else v for k,v in info.items()})
+
 
         return self.get_observation(), reward.detach(), info
 
