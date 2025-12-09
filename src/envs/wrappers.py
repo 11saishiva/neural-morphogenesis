@@ -265,7 +265,7 @@ class SortingEnv:
 
     def __init__(
         self, H=64, W=64, device='cpu', gamma_motion=0.1,
-        steps_per_action=6, obs_mode='local'
+        steps_per_action=12, obs_mode='local'
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
@@ -285,17 +285,17 @@ class SortingEnv:
         self.term_clip     = 50.0
 
         # EMA smoothing of delta_sort
-        self.sort_ema_alpha = 0.2
+        self.sort_ema_alpha = 0.5
         self._sort_ema = None
         self._last_sort_idx = None
 
         # RMS normalizer for pos_delta
-        self.pos_delta_rms_alpha = 0.05
+        self.pos_delta_rms_alpha = 0.01
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
         # Critical: scaling factor for sorting index
-        self.SORT_AMPLIFY = 5000.0   # your current research-default
+        self.SORT_AMPLIFY = 15000.0   # your current research-default
 
         # --- New integrated applied-sort settings ---
         # Toggle to enable/disable this additional applied_sort term.
