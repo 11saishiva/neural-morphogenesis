@@ -212,7 +212,7 @@ class SortingEnv:
         self.state = None
 
         # --- Reward shaping coefficients: “research-clean” defaults ---
-        self.sort_weight   = 800.0
+        self.sort_weight   = 1600.0
         self.sort_bonus    = 40.0
         self.energy_weight = 1.0
         self.motion_weight = 0.03
