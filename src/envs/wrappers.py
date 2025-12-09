@@ -433,9 +433,9 @@ class SortingEnv:
             #                   for k, v in info.items()}
             #     print("DBG_INFO:", small_info)
             # Probe snippet — paste into your training script where env is available
-            obs = env.reset(B=1)            # or whatever batch size you normally use
-            actions = torch.zeros(1, env.H*env.W, device=env.device)  # trivial action to probe
-            obs2, reward, info = env.step(actions)
+            obs = self.reset(B=1)            # or whatever batch size you normally use
+            actions = torch.zeros(1, self.H*self.W, device=self.device)  # trivial action to probe
+            obs2, reward, info = self.step(actions)
             # Print the key scalars for the first batch element
             print("probe -> reward:", float(reward[0].cpu().item()))
             print("interfacial_energy:", float(info["interfacial_energy"][0].cpu().item()))
