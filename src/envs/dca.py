@@ -130,6 +130,55 @@
 #         adhesion = state[:, ADH:ADH+1]
 #         d_types = self._adhesion_energy_delta(types, adhesion)
 #         state[:, :2] = self._soft_onehot_norm(types + 0.1 * d_types)
+#         # --------------------------------------------
+#         # NEW: Adhesion-driven physical migration
+#         # --------------------------------------------
+#         # Compute local gradients of type difference
+#         a = state[:, TYPE_A:TYPE_A+1]
+#         b = state[:, TYPE_B:TYPE_B+1]
+#         diff = a - b  # positive = A-dominant, negative = B-dominant
+
+#         # Sobel filters (edge-based gradients)
+#         sobel_x = torch.tensor([[-1,0,1],
+#                                 [-2,0,2],
+#                                 [-1,0,1]], dtype=torch.float32, device=state.device).view(1,1,3,3)
+
+#         sobel_y = torch.tensor([[-1,-2,-1],
+#                                 [ 0, 0, 0],
+#                                 [ 1, 2, 1]], dtype=torch.float32, device=state.device).view(1,1,3,3)
+
+#         gx = F.conv2d(diff, sobel_x, padding=1)
+#         gy = F.conv2d(diff, sobel_y, padding=1)
+
+#         # adhesion-modulated velocity
+#         adh = state[:, ADH:ADH+1]
+#         vx_adh = -adh * gx
+#         vy_adh = -adh * gy
+
+#         # normalize displacement
+#         scale = 0.02  # very small to ensure stability
+#         vx_norm = vx_adh * scale
+#         vy_norm = vy_adh * scale
+
+#         # build sampling grid
+#         B, _, H, W = state.shape
+#         ys, xs = torch.meshgrid(
+#             torch.linspace(-1, 1, H, device=state.device),
+#             torch.linspace(-1, 1, W, device=state.device),
+#             indexing='ij'
+#         )
+#         base = torch.stack((xs, ys), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+#         vx_pix = vx_norm / (W-1) * 2.0
+#         vy_pix = vy_norm / (H-1) * 2.0
+#         flow = torch.stack((vx_pix.squeeze(1), vy_pix.squeeze(1)), dim=-1)
+
+#         # Warp type channels only
+#         new_grid = (base + flow).clamp(-1.05, 1.05)
+#         types = state[:, :2]
+#         warped = F.grid_sample(types, new_grid, mode='bilinear', padding_mode='border', align_corners=True)
+#         state[:, :2] = warped
+
 
 #         # 4) morphogen: diffuse + SOFTEN DOMINANCE
 #         m = state[:, MORPH:MORPH+1]
@@ -138,7 +187,8 @@
 
 #         # ★★★ APPLY MORPHOGEN SOFTENING HERE ★★★
 #         # reduces strength without breaking gradient flow
-#         m = 0.5 * m
+#         #  Previously: m = 0.5 * m
+#         m = 0.8 * m
 
 #         state[:, MORPH:MORPH+1] = m
 
@@ -153,7 +203,6 @@
 #         for _ in range(steps):
 #             s = self.step(s, actions)
 #         return s
-
 
 
 import torch
@@ -182,7 +231,11 @@ CENTER = 4
 
 
 class DCA(nn.Module):
-    def __init__(self, step_size=0.2, advect_scale=0.5, morphogen_diffusion=0.05):
+    def __init__(self, step_size=0.3, advect_scale=2.0, morphogen_diffusion=0.08):
+        """
+        Increased advect_scale and step_size compared to previous defaults so actions
+        have a stronger, but still stable, effect.
+        """
         super().__init__()
         self.step_size = step_size
         self.advect_scale = advect_scale
@@ -229,10 +282,12 @@ class DCA(nn.Module):
         vx        = actions[:, 1:2]
         vy        = actions[:, 2:3]
 
-        # adhesion update
-        state[:, ADH:ADH+1] = (state[:, ADH:ADH+1] + delta_adh.clamp(-0.1, 0.1)).clamp(0.0, 1.0)
+        # ----- stronger adhesion update -----
+        # scale delta_adh so agent can change adhesion more aggressively (but still clamped)
+        adh_delta_scaled = (2.0 * delta_adh).clamp(-0.2, 0.2)  # action originally in [-0.1,0.1]
+        state[:, ADH:ADH+1] = (state[:, ADH:ADH+1] + adh_delta_scaled).clamp(0.0, 1.0)
 
-        # advection grid
+        # advection grid: amplify by advect_scale (default 2.0)
         vxs = self.advect_scale * vx
         vys = self.advect_scale * vy
 
@@ -243,6 +298,7 @@ class DCA(nn.Module):
         )
         base_grid = torch.stack((xs, ys), dim=-1).unsqueeze(0).repeat(B,1,1,1)
 
+        # normalize velocity to [-2,2] range over the grid mapping
         vx_norm = vxs / max(W-1, 1) * 2.0
         vy_norm = vys / max(H-1, 1) * 2.0
         flow = torch.stack((vx_norm.squeeze(1), vy_norm.squeeze(1)), dim=-1)
@@ -283,15 +339,17 @@ class DCA(nn.Module):
         residual   = self.update(perception)
         state[:, :4] = state[:, :4] + self.step_size * torch.tanh(residual)
 
-        # 3) adhesion-energy minimization
+        # 3) adhesion-energy minimization (made stronger)
         types = self._soft_onehot_norm(state[:, :2])
         adhesion = state[:, ADH:ADH+1]
         d_types = self._adhesion_energy_delta(types, adhesion)
-        state[:, :2] = self._soft_onehot_norm(types + 0.1 * d_types)
+
+        # Increase coefficient so adhesion energy has more visible effect on types
+        state[:, :2] = self._soft_onehot_norm(types + 0.4 * d_types)
+
         # --------------------------------------------
-        # NEW: Adhesion-driven physical migration
+        # Adhesion-driven physical migration (amplified)
         # --------------------------------------------
-        # Compute local gradients of type difference
         a = state[:, TYPE_A:TYPE_A+1]
         b = state[:, TYPE_B:TYPE_B+1]
         diff = a - b  # positive = A-dominant, negative = B-dominant
@@ -314,7 +372,8 @@ class DCA(nn.Module):
         vy_adh = -adh * gy
 
         # normalize displacement
-        scale = 0.02  # very small to ensure stability
+        # increased scale so adhesion gradients cause more movement (but still small)
+        scale = 0.08  # increased from 0.02
         vx_norm = vx_adh * scale
         vy_norm = vy_adh * scale
 
@@ -343,9 +402,7 @@ class DCA(nn.Module):
         m = self._morphogen_diffuse(m)
         m = m.clamp(0.0, 1.0)
 
-        # ★★★ APPLY MORPHOGEN SOFTENING HERE ★★★
-        # reduces strength without breaking gradient flow
-        #  Previously: m = 0.5 * m
+        # retain a softened morphogen but not too tiny
         m = 0.8 * m
 
         state[:, MORPH:MORPH+1] = m
