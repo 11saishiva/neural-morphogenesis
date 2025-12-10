@@ -268,9 +268,9 @@ class SortingEnv:
         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
         # Reduced sort amplification and weights to avoid huge transient spikes
         self.sort_weight   = 160.0    # was 200.0
-        self.sort_bonus    = 2.0      # keep small
+        self.sort_bonus    = 5.0      # keep small
         self.energy_weight = 1.0
-        self.motion_weight = 0.03
+        self.motion_weight = 0.003
         self.reward_clip   = 50.0
         self.term_clip     = 50.0
 
