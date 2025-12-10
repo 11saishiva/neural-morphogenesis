@@ -23,26 +23,28 @@
 #         self.dca = DCA().to(self.device)
 #         self.state = None
 
-#         # --- Reward shaping coefficients: “research-clean” defaults ---
-#         self.sort_weight   = 1600.0
-#         self.sort_bonus    = 40.0
+#         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
+#         # Reduced sort amplification and weights to avoid huge transient spikes
+#         self.sort_weight   = 200.0    # reduced from 400.0
+#         self.sort_bonus    = 2.0      # reduced from 8.0
 #         self.energy_weight = 1.0
 #         self.motion_weight = 0.03
 #         self.reward_clip   = 50.0
 #         self.term_clip     = 50.0
 
 #         # EMA smoothing of delta_sort
-#         self.sort_ema_alpha = 0.2
+#         self.sort_ema_alpha = 0.4     # more reactive than 0.3 but not too noisy
 #         self._sort_ema = None
 #         self._last_sort_idx = None
 
 #         # RMS normalizer for pos_delta
-#         self.pos_delta_rms_alpha = 0.05
+#         self.pos_delta_rms_alpha = 0.20  # adapt rms faster than 0.10
 #         self._pos_delta_rms = None
 #         self._pos_delta_eps = 1e-6
 
 #         # Critical: scaling factor for sorting index
-#         self.SORT_AMPLIFY = 5000.0   # your current research-default
+#         # Reduced so raw_sort_idx * SORT_AMPLIFY is not huge
+#         self.SORT_AMPLIFY = 200.0   # reduced from 1000.0
 
 
 #     # ---------------------------------------------------------
@@ -237,6 +239,7 @@
 #     def current_state(self):
 #         return self.state.detach().clone()
 
+
 import torch
 import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
@@ -264,27 +267,33 @@ class SortingEnv:
 
         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
         # Reduced sort amplification and weights to avoid huge transient spikes
-        self.sort_weight   = 200.0    # reduced from 400.0
-        self.sort_bonus    = 2.0      # reduced from 8.0
+        self.sort_weight   = 160.0    # was 200.0
+        self.sort_bonus    = 2.0      # keep small
         self.energy_weight = 1.0
         self.motion_weight = 0.03
         self.reward_clip   = 50.0
         self.term_clip     = 50.0
 
         # EMA smoothing of delta_sort
-        self.sort_ema_alpha = 0.4     # more reactive than 0.3 but not too noisy
+        self.sort_ema_alpha = 0.45     # slightly more responsive
         self._sort_ema = None
         self._last_sort_idx = None
 
         # RMS normalizer for pos_delta
-        self.pos_delta_rms_alpha = 0.20  # adapt rms faster than 0.10
+        self.pos_delta_rms_alpha = 0.25  # adapt rms a bit faster
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
         # Critical: scaling factor for sorting index
         # Reduced so raw_sort_idx * SORT_AMPLIFY is not huge
-        self.SORT_AMPLIFY = 200.0   # reduced from 1000.0
+        self.SORT_AMPLIFY = 150.0   # was 200.0 / 1000.0
 
+        # Moving averages of raw sorting index (for diagnostics)
+        self._raw_sort_ma20 = None
+        self._raw_sort_ma50 = None
+
+        # Simple env step counter for logging
+        self._env_step = 0
 
     # ---------------------------------------------------------
     # Helper: create a morphogen band
@@ -293,7 +302,6 @@ class SortingEnv:
         x = torch.linspace(0, 1, self.W, device=self.device)
         x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
         return x
-
 
     # ---------------------------------------------------------
     # Reset environment
@@ -325,8 +333,14 @@ class SortingEnv:
         # RMS normalizer initialised to 1
         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
 
-        return self.get_observation()
+        # seed moving averages for raw sorting index
+        self._raw_sort_ma20 = raw.clone()
+        self._raw_sort_ma50 = raw.clone()
 
+        # reset env step counter
+        self._env_step = 0
+
+        return self.get_observation()
 
     # ---------------------------------------------------------
     def get_observation(self):
@@ -340,7 +354,6 @@ class SortingEnv:
         else:
             raise ValueError("obs_mode must be 'global' or 'local'")
 
-
     # ---------------------------------------------------------
     # Sorting index = difference of mean A on left vs right half
     # ---------------------------------------------------------
@@ -351,7 +364,6 @@ class SortingEnv:
         right = A[:, :, mid:].mean(dim=[1, 2])
         return torch.abs(left - right)
 
-
     # ---------------------------------------------------------
     # MAIN STEP FUNCTION
     # ---------------------------------------------------------
@@ -360,6 +372,7 @@ class SortingEnv:
             raise RuntimeError("Call reset() before step().")
 
         B = self.state.shape[0]
+        self._env_step += 1
 
         # reshape local actions
         if self.obs_mode == 'local':
@@ -414,10 +427,23 @@ class SortingEnv:
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
             # -----------------------------------------------------
-            # REWARD TERMS (unchanged, but now we will add diagnostics)
+            # Moving averages of raw sorting index (diagnostics)
             # -----------------------------------------------------
-            sort_term  = self.sort_weight * norm_pos_delta
-            bonus_term = self.sort_bonus * raw_sort_idx
+            if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
+                # re-init if batch size changes
+                self._raw_sort_ma20 = raw_sort_idx.clone()
+                self._raw_sort_ma50 = raw_sort_idx.clone()
+            else:
+                alpha20 = 2.0 / (20.0 + 1.0)
+                alpha50 = 2.0 / (50.0 + 1.0)
+                self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
+                self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
+
+            # -----------------------------------------------------
+            # REWARD TERMS
+            # -----------------------------------------------------
+            sort_term   = self.sort_weight * norm_pos_delta
+            bonus_term  = self.sort_bonus * raw_sort_idx
             energy_term = -self.energy_weight * e
             motion_term = -self.motion_weight * mpen
 
@@ -432,23 +458,39 @@ class SortingEnv:
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
             # -----------------------------------------------------
-            # NEW DIAGNOSTICS (Action A)
+            # SCALARS + MINIMAL LOGGING (Option A)
             # -----------------------------------------------------
             def _scalar(x):
                 return float(x.detach().cpu().mean())
 
+            raw_mean = _scalar(raw_sort_idx)
+            ma20_mean = _scalar(self._raw_sort_ma20)
+            ma50_mean = _scalar(self._raw_sort_ma50)
+            reward_mean = _scalar(reward)
+
+            # print every 10 env steps (minimal)
+            if (self._env_step % 10) == 0:
+                print(
+                    f"[SORT-MA] step={self._env_step} "
+                    f"raw={raw_mean:.6f} ma20={ma20_mean:.6f} ma50={ma50_mean:.6f} "
+                    f"reward_mean={reward_mean:.6f}",
+                    flush=True,
+                )
+
             reward_components = {
-                "reward_mean": _scalar(reward),
+                "reward_mean": reward_mean,
                 "sort_term_mean": _scalar(sort_term),
                 "bonus_term_mean": _scalar(bonus_term),
                 "energy_term_mean": _scalar(energy_term),
                 "motion_term_mean": _scalar(motion_term),
-                "raw_sort_idx_mean": _scalar(raw_sort_idx),
+                "raw_sort_idx_mean": raw_mean,
                 "sort_idx_mean": _scalar(sort_idx),
                 "pos_delta_mean": _scalar(pos_delta),
                 "interfacial_energy_mean": _scalar(e),
                 "motion_penalty_mean": _scalar(mpen),
                 "running_scale_mean": _scalar(running_scale),
+                "raw_sort_ma20_mean": ma20_mean,
+                "raw_sort_ma50_mean": ma50_mean,
                 "steps_per_action": float(self.steps_per_action),
             }
 
@@ -468,11 +510,12 @@ class SortingEnv:
                 "bonus_term": bonus_term.cpu(),
                 "energy_term": energy_term.cpu(),
                 "motion_term": motion_term.cpu(),
-                "reward_components": reward_components,   # NEW
+                "raw_sort_ma20": self._raw_sort_ma20.cpu(),
+                "raw_sort_ma50": self._raw_sort_ma50.cpu(),
+                "reward_components": reward_components,
             }
 
         return self.get_observation(), reward.detach(), info
-
 
     # ---------------------------------------------------------
     def current_state(self):
