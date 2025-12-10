@@ -267,7 +267,7 @@ class SortingEnv:
 
         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
         # Reduced sort amplification and weights to avoid huge transient spikes
-        self.sort_weight   = 400.0    # was 200.0
+        self.sort_weight   = 600.0    # was 200.0
         self.sort_bonus    = 4.0      # keep small
         self.energy_weight = 1.0
         self.motion_weight = 0.003
@@ -275,18 +275,18 @@ class SortingEnv:
         self.term_clip     = 50.0
 
         # EMA smoothing of delta_sort
-        self.sort_ema_alpha = 0.20     # slightly more responsive
+        self.sort_ema_alpha = 0.12     # slightly more responsive
         self._sort_ema = None
         self._last_sort_idx = None
 
         # RMS normalizer for pos_delta
-        self.pos_delta_rms_alpha = 0.05  # adapt rms a bit faster
+        self.pos_delta_rms_alpha = 0.02  # adapt rms a bit faster
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
         # Critical: scaling factor for sorting index
         # Reduced so raw_sort_idx * SORT_AMPLIFY is not huge
-        self.SORT_AMPLIFY = 150.0   # was 200.0 / 1000.0
+        self.SORT_AMPLIFY = 400.0   # was 200.0 / 1000.0
 
         # Moving averages of raw sorting index (for diagnostics)
         self._raw_sort_ma20 = None
