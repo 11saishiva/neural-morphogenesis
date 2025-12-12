@@ -25,27 +25,32 @@
 
 #         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
 #         # Reduced sort amplification and weights to avoid huge transient spikes
-#         self.sort_weight   = 200.0    # reduced from 400.0
-#         self.sort_bonus    = 2.0      # reduced from 8.0
+#         self.sort_weight   = 600.0    # was 200.0
+#         self.sort_bonus    = 2.0      # keep small
 #         self.energy_weight = 1.0
-#         self.motion_weight = 0.03
+#         self.motion_weight = 0.02
 #         self.reward_clip   = 50.0
 #         self.term_clip     = 50.0
 
 #         # EMA smoothing of delta_sort
-#         self.sort_ema_alpha = 0.4     # more reactive than 0.3 but not too noisy
+#         self.sort_ema_alpha = 0.12     # slightly more responsive
 #         self._sort_ema = None
 #         self._last_sort_idx = None
 
 #         # RMS normalizer for pos_delta
-#         self.pos_delta_rms_alpha = 0.20  # adapt rms faster than 0.10
+#         self.pos_delta_rms_alpha = 0.02  # adapt rms a bit slower / stable
 #         self._pos_delta_rms = None
 #         self._pos_delta_eps = 1e-6
 
 #         # Critical: scaling factor for sorting index
-#         # Reduced so raw_sort_idx * SORT_AMPLIFY is not huge
-#         self.SORT_AMPLIFY = 200.0   # reduced from 1000.0
+#         self.SORT_AMPLIFY = 400.0
 
+#         # Moving averages of raw sorting index (for diagnostics)
+#         self._raw_sort_ma20 = None
+#         self._raw_sort_ma50 = None
+
+#         # Simple env step counter for logging
+#         self._env_step = 0
 
 #     # ---------------------------------------------------------
 #     # Helper: create a morphogen band
@@ -54,7 +59,6 @@
 #         x = torch.linspace(0, 1, self.W, device=self.device)
 #         x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
 #         return x
-
 
 #     # ---------------------------------------------------------
 #     # Reset environment
@@ -86,8 +90,14 @@
 #         # RMS normalizer initialised to 1
 #         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
 
-#         return self.get_observation()
+#         # seed moving averages for raw sorting index
+#         self._raw_sort_ma20 = raw.clone()
+#         self._raw_sort_ma50 = raw.clone()
 
+#         # reset env step counter
+#         self._env_step = 0
+
+#         return self.get_observation()
 
 #     # ---------------------------------------------------------
 #     def get_observation(self):
@@ -101,7 +111,6 @@
 #         else:
 #             raise ValueError("obs_mode must be 'global' or 'local'")
 
-
 #     # ---------------------------------------------------------
 #     # Sorting index = difference of mean A on left vs right half
 #     # ---------------------------------------------------------
@@ -112,7 +121,6 @@
 #         right = A[:, :, mid:].mean(dim=[1, 2])
 #         return torch.abs(left - right)
 
-
 #     # ---------------------------------------------------------
 #     # MAIN STEP FUNCTION
 #     # ---------------------------------------------------------
@@ -121,6 +129,7 @@
 #             raise RuntimeError("Call reset() before step().")
 
 #         B = self.state.shape[0]
+#         self._env_step += 1
 
 #         # reshape local actions
 #         if self.obs_mode == 'local':
@@ -174,11 +183,27 @@
 
 #             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
+#             # keep a tensor mean (do NOT convert to Python float here)
+#             norm_pos_delta_mean_t = norm_pos_delta.mean()
+
 #             # -----------------------------------------------------
-#             # REWARD TERMS (unchanged, but now we will add diagnostics)
+#             # Moving averages of raw sorting index (diagnostics)
 #             # -----------------------------------------------------
-#             sort_term  = self.sort_weight * norm_pos_delta
-#             bonus_term = self.sort_bonus * raw_sort_idx
+#             if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
+#                 # re-init if batch size changes
+#                 self._raw_sort_ma20 = raw_sort_idx.clone()
+#                 self._raw_sort_ma50 = raw_sort_idx.clone()
+#             else:
+#                 alpha20 = 2.0 / (20.0 + 1.0)
+#                 alpha50 = 2.0 / (50.0 + 1.0)
+#                 self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
+#                 self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
+
+#             # -----------------------------------------------------
+#             # REWARD TERMS
+#             # -----------------------------------------------------
+#             sort_term   = self.sort_weight * norm_pos_delta
+#             bonus_term  = self.sort_bonus * raw_sort_idx
 #             energy_term = -self.energy_weight * e
 #             motion_term = -self.motion_weight * mpen
 
@@ -193,23 +218,40 @@
 #             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
 #             # -----------------------------------------------------
-#             # NEW DIAGNOSTICS (Action A)
+#             # SCALARS + MINIMAL LOGGING (Option A)
 #             # -----------------------------------------------------
 #             def _scalar(x):
 #                 return float(x.detach().cpu().mean())
 
+#             raw_mean = _scalar(raw_sort_idx)
+#             ma20_mean = _scalar(self._raw_sort_ma20)
+#             ma50_mean = _scalar(self._raw_sort_ma50)
+#             reward_mean = _scalar(reward)
+
+#             # print every 10 env steps (minimal)
+#             if (self._env_step % 10) == 0:
+#                 print(
+#                     f"[SORT-MA] step={self._env_step} "
+#                     f"raw={raw_mean:.6f} ma20={ma20_mean:.6f} ma50={ma50_mean:.6f} "
+#                     f"reward_mean={reward_mean:.6f}",
+#                     flush=True,
+#                 )
+
 #             reward_components = {
-#                 "reward_mean": _scalar(reward),
+#                 "reward_mean": reward_mean,
 #                 "sort_term_mean": _scalar(sort_term),
 #                 "bonus_term_mean": _scalar(bonus_term),
 #                 "energy_term_mean": _scalar(energy_term),
 #                 "motion_term_mean": _scalar(motion_term),
-#                 "raw_sort_idx_mean": _scalar(raw_sort_idx),
+#                 "raw_sort_idx_mean": raw_mean,
 #                 "sort_idx_mean": _scalar(sort_idx),
 #                 "pos_delta_mean": _scalar(pos_delta),
+#                 "norm_pos_delta_mean": _scalar(norm_pos_delta_mean_t),
 #                 "interfacial_energy_mean": _scalar(e),
 #                 "motion_penalty_mean": _scalar(mpen),
 #                 "running_scale_mean": _scalar(running_scale),
+#                 "raw_sort_ma20_mean": ma20_mean,
+#                 "raw_sort_ma50_mean": ma50_mean,
 #                 "steps_per_action": float(self.steps_per_action),
 #             }
 
@@ -222,6 +264,7 @@
 #                 "delta_sort_index": delta_sort.cpu(),
 #                 "smoothed_delta": self._sort_ema.cpu(),
 #                 "pos_delta": pos_delta.cpu(),
+#                 "norm_pos_delta_mean": norm_pos_delta_mean_t.detach().cpu(),
 #                 "pos_delta_rms": self._pos_delta_rms.cpu(),
 #                 "running_scale": running_scale.cpu(),
 #                 "norm_pos_delta": norm_pos_delta.cpu(),
@@ -229,17 +272,19 @@
 #                 "bonus_term": bonus_term.cpu(),
 #                 "energy_term": energy_term.cpu(),
 #                 "motion_term": motion_term.cpu(),
-#                 "reward_components": reward_components,   # NEW
+#                 "raw_sort_ma20": self._raw_sort_ma20.cpu(),
+#                 "raw_sort_ma50": self._raw_sort_ma50.cpu(),
+#                 "reward_components": reward_components,
 #             }
 
 #         return self.get_observation(), reward.detach(), info
-
 
 #     # ---------------------------------------------------------
 #     def current_state(self):
 #         return self.state.detach().clone()
 
 
+# wrappers.py
 import torch
 import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
@@ -262,32 +307,35 @@ class SortingEnv:
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
+        # DCA model
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
-        # Reduced sort amplification and weights to avoid huge transient spikes
-        self.sort_weight   = 600.0    # was 200.0
-        self.sort_bonus    = 2.0      # keep small
+        # -----------------------------
+        # Final tuned hyperparameters
+        # -----------------------------
+        # Reward shaping coefficients (balanced, less spikey)
+        self.sort_weight   = 300.0    # moderate
+        self.sort_bonus    = 2.0
         self.energy_weight = 1.0
-        self.motion_weight = 0.02
+        self.motion_weight = 0.03     # penalize motion a bit more
         self.reward_clip   = 50.0
         self.term_clip     = 50.0
 
-        # EMA smoothing of delta_sort
-        self.sort_ema_alpha = 0.12     # slightly more responsive
+        # EMA smoothing of delta_sort: responsive but stable
+        self.sort_ema_alpha = 0.08
         self._sort_ema = None
         self._last_sort_idx = None
 
-        # RMS normalizer for pos_delta
-        self.pos_delta_rms_alpha = 0.02  # adapt rms a bit slower / stable
+        # RMS normalizer for pos_delta: stable running RMS
+        self.pos_delta_rms_alpha = 0.05
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
-        # Critical: scaling factor for sorting index
-        self.SORT_AMPLIFY = 400.0
+        # Sorting index amplification (moderate)
+        self.SORT_AMPLIFY = 500.0
 
-        # Moving averages of raw sorting index (for diagnostics)
+        # Moving averages of raw sorting index (diagnostics)
         self._raw_sort_ma20 = None
         self._raw_sort_ma50 = None
 
@@ -373,21 +421,21 @@ class SortingEnv:
         B = self.state.shape[0]
         self._env_step += 1
 
-        # reshape local actions
+        # reshape local actions (expected shape (B, N, A) where N=H*W)
         if self.obs_mode == 'local':
             N = self.H * self.W
             if actions.dim() != 3 or actions.shape[1] != N:
                 raise ValueError(f"Expected (B, N, A). Got {actions.shape}")
+            # actions: (B, N, A) -> (B, A, H, W)
             actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
 
         with torch.no_grad():
-            # -------------------
-            # Apply DCA for k steps
-            # -------------------
+            # Apply DCA for steps_per_action steps
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
 
+            # update environment state
             self.state = s.detach().clone()
 
             # Compute energy + motion
@@ -395,7 +443,7 @@ class SortingEnv:
             mpen = motion_penalty(actions.detach()).detach()      # (B,)
 
             # Sorting index
-            raw_sort_idx = self._sorting_index(self.state).detach()
+            raw_sort_idx = self._sorting_index(self.state).detach()  # (B,)
             sort_idx = raw_sort_idx * self.SORT_AMPLIFY
 
             if self._last_sort_idx is None:
@@ -405,41 +453,25 @@ class SortingEnv:
 
             self._last_sort_idx = sort_idx.detach().clone()
 
-            # EMA of delta-sort
+            # EMA of delta-sort: ensure shape matches
             if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
                 self._sort_ema = torch.zeros_like(sort_idx)
 
-            α = float(self.sort_ema_alpha)
-            self._sort_ema = (1 - α) * self._sort_ema.to(sort_idx.device) + α * delta_sort
+            alpha = float(self.sort_ema_alpha)
+            self._sort_ema = (1 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
 
-            pos_delta = torch.relu(self._sort_ema)
+            pos_delta = torch.relu(self._sort_ema)  # only positive improvements
 
-            # RMS norm
+            # RMS normalization for pos_delta
             if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
                 self._pos_delta_rms = torch.ones_like(pos_delta)
 
-            β = float(self.pos_delta_rms_alpha)
+            beta = float(self.pos_delta_rms_alpha)
             sq = pos_delta ** 2
-            self._pos_delta_rms = (1 - β) * self._pos_delta_rms.to(pos_delta.device) + β * sq
+            self._pos_delta_rms = (1 - beta) * self._pos_delta_rms.to(pos_delta.device) + beta * sq
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
-            norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
-
-            # keep a tensor mean (do NOT convert to Python float here)
-            norm_pos_delta_mean_t = norm_pos_delta.mean()
-
-            # -----------------------------------------------------
-            # Moving averages of raw sorting index (diagnostics)
-            # -----------------------------------------------------
-            if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
-                # re-init if batch size changes
-                self._raw_sort_ma20 = raw_sort_idx.clone()
-                self._raw_sort_ma50 = raw_sort_idx.clone()
-            else:
-                alpha20 = 2.0 / (20.0 + 1.0)
-                alpha50 = 2.0 / (50.0 + 1.0)
-                self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
-                self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
+            norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)  # (B,)
 
             # -----------------------------------------------------
             # REWARD TERMS
@@ -449,7 +481,7 @@ class SortingEnv:
             energy_term = -self.energy_weight * e
             motion_term = -self.motion_weight * mpen
 
-            # Clip per-term
+            # Clip per-term to avoid extreme contributions
             sort_term   = torch.clamp(sort_term, -self.term_clip, self.term_clip)
             bonus_term  = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
@@ -459,67 +491,74 @@ class SortingEnv:
             reward = reward / float(self.steps_per_action)
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
-            # -----------------------------------------------------
-            # SCALARS + MINIMAL LOGGING (Option A)
-            # -----------------------------------------------------
-            def _scalar(x):
+            # -------------------------
+            # Lightweight scalar summaries
+            # -------------------------
+            def _scalar_mean_tensor(x):
+                """Return python float mean of a tensor x."""
                 return float(x.detach().cpu().mean())
 
-            raw_mean = _scalar(raw_sort_idx)
-            ma20_mean = _scalar(self._raw_sort_ma20)
-            ma50_mean = _scalar(self._raw_sort_ma50)
-            reward_mean = _scalar(reward)
+            raw_mean = _scalar_mean_tensor(raw_sort_idx)
+            ma20_mean = _scalar_mean_tensor(self._raw_sort_ma20) if (self._raw_sort_ma20 is not None) else raw_mean
+            ma50_mean = _scalar_mean_tensor(self._raw_sort_ma50) if (self._raw_sort_ma50 is not None) else raw_mean
+            reward_mean = _scalar_mean_tensor(reward)
+            norm_pos_delta_mean = float(norm_pos_delta.detach().cpu().mean())
 
-            # print every 10 env steps (minimal)
+            # Update (exponential) moving averages of raw sorting index for diagnostics
+            if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
+                self._raw_sort_ma20 = raw_sort_idx.clone()
+                self._raw_sort_ma50 = raw_sort_idx.clone()
+            else:
+                alpha20 = 2.0 / (20.0 + 1.0)
+                alpha50 = 2.0 / (50.0 + 1.0)
+                self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
+                self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
+
+            # Minimal console logging every 10 env steps
             if (self._env_step % 10) == 0:
                 print(
                     f"[SORT-MA] step={self._env_step} "
-                    f"raw={raw_mean:.6f} ma20={ma20_mean:.6f} ma50={ma50_mean:.6f} "
-                    f"reward_mean={reward_mean:.6f}",
+                    f"raw={raw_mean:.6e} ma20={ma20_mean:.6e} ma50={ma50_mean:.6e} "
+                    f"reward_mean={reward_mean:.6f} norm_pos_delta={norm_pos_delta_mean:.6e}",
                     flush=True,
                 )
 
+            # Reward components (small python floats) for easy logging / monitoring
             reward_components = {
                 "reward_mean": reward_mean,
-                "sort_term_mean": _scalar(sort_term),
-                "bonus_term_mean": _scalar(bonus_term),
-                "energy_term_mean": _scalar(energy_term),
-                "motion_term_mean": _scalar(motion_term),
+                "sort_term_mean": _scalar_mean_tensor(sort_term),
+                "bonus_term_mean": _scalar_mean_tensor(bonus_term),
+                "energy_term_mean": _scalar_mean_tensor(energy_term),
+                "motion_term_mean": _scalar_mean_tensor(motion_term),
                 "raw_sort_idx_mean": raw_mean,
-                "sort_idx_mean": _scalar(sort_idx),
-                "pos_delta_mean": _scalar(pos_delta),
-                "norm_pos_delta_mean": _scalar(norm_pos_delta_mean_t),
-                "interfacial_energy_mean": _scalar(e),
-                "motion_penalty_mean": _scalar(mpen),
-                "running_scale_mean": _scalar(running_scale),
+                "sort_idx_mean": float(sort_idx.detach().cpu().mean()),
+                "pos_delta_mean": float(pos_delta.detach().cpu().mean()),
+                "norm_pos_delta_mean": norm_pos_delta_mean,
+                "interfacial_energy_mean": _scalar_mean_tensor(e),
+                "motion_penalty_mean": _scalar_mean_tensor(mpen),
+                "running_scale_mean": float(running_scale.detach().cpu().mean()),
                 "raw_sort_ma20_mean": ma20_mean,
                 "raw_sort_ma50_mean": ma50_mean,
                 "steps_per_action": float(self.steps_per_action),
             }
 
-            # Full tensor info for debugging
+            # Info: keep only small CPU tensors and scalar summaries
             info = {
-                "interfacial_energy": e.cpu(),
-                "motion_penalty": mpen.cpu(),
-                "raw_sort_index": raw_sort_idx.cpu(),
-                "sort_index": sort_idx.cpu(),
-                "delta_sort_index": delta_sort.cpu(),
-                "smoothed_delta": self._sort_ema.cpu(),
-                "pos_delta": pos_delta.cpu(),
-                "norm_pos_delta_mean": norm_pos_delta_mean_t.detach().cpu(),
-                "pos_delta_rms": self._pos_delta_rms.cpu(),
-                "running_scale": running_scale.cpu(),
-                "norm_pos_delta": norm_pos_delta.cpu(),
-                "sort_term": sort_term.cpu(),
-                "bonus_term": bonus_term.cpu(),
-                "energy_term": energy_term.cpu(),
-                "motion_term": motion_term.cpu(),
-                "raw_sort_ma20": self._raw_sort_ma20.cpu(),
-                "raw_sort_ma50": self._raw_sort_ma50.cpu(),
+                "interfacial_energy": e.detach().cpu(),        # (B,)
+                "motion_penalty": mpen.detach().cpu(),         # (B,)
+                "raw_sort_index": raw_sort_idx.detach().cpu(), # (B,)
+                "sort_index": sort_idx.detach().cpu(),         # (B,)
+                "delta_sort_index": delta_sort.detach().cpu(),
+                "smoothed_delta": self._sort_ema.detach().cpu(),
+                # scalar summaries to avoid heavy transfers
+                "norm_pos_delta_mean": norm_pos_delta_mean,
+                "pos_delta_rms": self._pos_delta_rms.detach().cpu(),
+                "running_scale": running_scale.detach().cpu(),
                 "reward_components": reward_components,
             }
 
-        return self.get_observation(), reward.detach(), info
+        # Return observation, CPU reward tensor, and light info dict
+        return self.get_observation(), reward.detach().cpu(), info
 
     # ---------------------------------------------------------
     def current_state(self):
