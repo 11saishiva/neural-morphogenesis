@@ -280,13 +280,12 @@ class SortingEnv:
         self._last_sort_idx = None
 
         # RMS normalizer for pos_delta
-        self.pos_delta_rms_alpha = 0.02  # adapt rms a bit faster
+        self.pos_delta_rms_alpha = 0.02  # adapt rms a bit slower / stable
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
         # Critical: scaling factor for sorting index
-        # Reduced so raw_sort_idx * SORT_AMPLIFY is not huge
-        self.SORT_AMPLIFY = 400.0   # was 200.0 / 1000.0
+        self.SORT_AMPLIFY = 400.0
 
         # Moving averages of raw sorting index (for diagnostics)
         self._raw_sort_ma20 = None
@@ -425,9 +424,9 @@ class SortingEnv:
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
-            norm_pos_delta_mean = float(norm_pos_delta.mean().detach().cpu())
-            # include norm_pos_delta_mean in your reward summary / SORT-MA prints
 
+            # keep a tensor mean (do NOT convert to Python float here)
+            norm_pos_delta_mean_t = norm_pos_delta.mean()
 
             # -----------------------------------------------------
             # Moving averages of raw sorting index (diagnostics)
@@ -489,7 +488,7 @@ class SortingEnv:
                 "raw_sort_idx_mean": raw_mean,
                 "sort_idx_mean": _scalar(sort_idx),
                 "pos_delta_mean": _scalar(pos_delta),
-                "norm_pos_delta_mean" : _scalar(norm_pos_delta_mean),
+                "norm_pos_delta_mean": _scalar(norm_pos_delta_mean_t),
                 "interfacial_energy_mean": _scalar(e),
                 "motion_penalty_mean": _scalar(mpen),
                 "running_scale_mean": _scalar(running_scale),
@@ -507,7 +506,7 @@ class SortingEnv:
                 "delta_sort_index": delta_sort.cpu(),
                 "smoothed_delta": self._sort_ema.cpu(),
                 "pos_delta": pos_delta.cpu(),
-                "norm_pos_delta_mean" : norm_pos_delta_mean.cpu(),
+                "norm_pos_delta_mean": norm_pos_delta_mean_t.detach().cpu(),
                 "pos_delta_rms": self._pos_delta_rms.cpu(),
                 "running_scale": running_scale.cpu(),
                 "norm_pos_delta": norm_pos_delta.cpu(),
