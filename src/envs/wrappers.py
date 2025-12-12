@@ -309,11 +309,11 @@ class SortingEnv:
         self.state = None
 
         # -----------------------------
-        # Final tuned hyperparameters
+        # Tuned hyperparameters (final pass)
         # -----------------------------
         self.sort_weight   = 300.0    # reward weight on delta-based improvements (EMA-normalized)
-        # Immediate bonus now small + saturating (see step())
-        self.sort_bonus    = 5.0      # moderate immediate bonus (saturated by tanh)
+        # immediate bonus uses baseline subtraction + tanh saturation
+        self.sort_bonus    = 5.0
         self.energy_weight = 1.0
         self.motion_weight = 0.03
         self.reward_clip   = 50.0
@@ -322,15 +322,19 @@ class SortingEnv:
         # EMA smoothing of delta_sort: responsive but stable
         self.sort_ema_alpha = 0.08
         self._sort_ema = None
-        self._last_sort_idx = None
 
         # RMS normalizer for pos_delta
         self.pos_delta_rms_alpha = 0.05
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
 
-        # Sorting index amplification (moderate)
-        self.SORT_AMPLIFY = 200.0
+        # Sorting index amplification (we amplify raw signals for both bonus and delta)
+        # Increased so tiny raw differences become meaningful to the RL reward.
+        self.SORT_AMPLIFY = 1000.0
+
+        # Track last raw sorting index (unamplified). We'll compute deltas on raw idx,
+        # then amplify the delta for EMA / pos_delta computation.
+        self._last_raw_sort = None
 
         # Moving averages of raw sorting index (for diagnostics)
         self._raw_sort_ma20 = None
@@ -369,10 +373,10 @@ class SortingEnv:
         # initialize EMA of delta-sort
         self._sort_ema = torch.zeros(B_actual, device=self.device)
 
+        # initialize last raw sort index
         with torch.no_grad():
             raw = self._sorting_index(self.state).detach()
-            amp = raw * self.SORT_AMPLIFY
-            self._last_sort_idx = amp.clone()
+            self._last_raw_sort = raw.clone()
 
         # RMS normalizer initialised to 1
         self._pos_delta_rms = torch.ones(B_actual, device=self.device) * 1.0
@@ -414,10 +418,8 @@ class SortingEnv:
     @staticmethod
     def _safe_scalar(x):
         if isinstance(x, torch.Tensor):
-            # convert to python float using mean for batched tensors if needed
             return float(x.detach().cpu().mean())
         else:
-            # assume it's already a scalar-like float/int
             return float(x)
 
     # ---------------------------------------------------------
@@ -451,23 +453,36 @@ class SortingEnv:
             e = interfacial_energy(self.state).detach()           # (B,)
             mpen = motion_penalty(actions.detach()).detach()      # (B,)
 
-            # Sorting index
+            # Sorting index (raw, small)
             raw_sort_idx = self._sorting_index(self.state).detach()  # (B,)
+
+            # amplified sort index used for bonus etc.
             sort_idx = raw_sort_idx * self.SORT_AMPLIFY               # (B,)
 
-            if self._last_sort_idx is None:
-                delta_sort = torch.zeros_like(sort_idx)
+            # -------------------------
+            # delta computation (CRITICAL CHANGE)
+            # - compute delta on raw_sort_idx (unamplified)
+            # - amplify the delta when feeding the EMA
+            # This avoids tiny raw numbers being rounded away; amplifying the delta
+            # makes `pos_delta` nonzero while preserving scale reasoning.
+            # -------------------------
+            if self._last_raw_sort is None:
+                delta_raw = torch.zeros_like(raw_sort_idx)
             else:
-                delta_sort = sort_idx - self._last_sort_idx
+                delta_raw = raw_sort_idx - self._last_raw_sort
 
-            self._last_sort_idx = sort_idx.detach().clone()
+            # store last raw for next step
+            self._last_raw_sort = raw_sort_idx.detach().clone()
+
+            # amplify the raw delta for EMA
+            delta_sort = delta_raw * self.SORT_AMPLIFY
 
             # EMA of delta-sort
-            if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
-                self._sort_ema = torch.zeros_like(sort_idx)
+            if self._sort_ema is None or self._sort_ema.shape[0] != delta_sort.shape[0]:
+                self._sort_ema = torch.zeros_like(delta_sort)
 
             α = float(self.sort_ema_alpha)
-            self._sort_ema = (1 - α) * self._sort_ema.to(sort_idx.device) + α * delta_sort
+            self._sort_ema = (1 - α) * self._sort_ema.to(delta_sort.device) + α * delta_sort
 
             pos_delta = torch.relu(self._sort_ema)
 
@@ -481,8 +496,6 @@ class SortingEnv:
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
-
-            # compute a float mean for logging without breaking tensor shapes
             norm_pos_delta_mean = self._safe_scalar(norm_pos_delta)
 
             # -----------------------------------------------------
@@ -502,9 +515,14 @@ class SortingEnv:
             # REWARD TERMS
             # -----------------------------------------------------
             sort_term   = self.sort_weight * norm_pos_delta            # (B,)
-            # immediate bonus uses amplified sort_idx, but apply tanh to avoid runaway constant
-            # use scaled tanh so small sort_idx still gives proportional reward, large values saturate
-            bonus_term = self.sort_bonus * torch.tanh(sort_idx)       # (B,)
+
+            # baseline-subtracted immediate bonus:
+            # amplify baseline for consistent scale, subtract from current amplified index,
+            # apply relu and tanh saturation to avoid runaway constants.
+            baseline_ampl = self._raw_sort_ma20 * self.SORT_AMPLIFY
+            immediate_excess = torch.relu(sort_idx - baseline_ampl)
+            bonus_term = self.sort_bonus * torch.tanh(immediate_excess)  # (B,)
+
             energy_term = -self.energy_weight * e                     # (B,)
             motion_term = -self.motion_weight * mpen                  # (B,)
 
@@ -519,7 +537,7 @@ class SortingEnv:
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
             # -----------------------------------------------------
-            # SCALARS + MINIMAL LOGGING (Option A)
+            # SCALARS + MINIMAL LOGGING
             # -----------------------------------------------------
             raw_mean = self._safe_scalar(raw_sort_idx)
             ma20_mean = self._safe_scalar(self._raw_sort_ma20)
@@ -528,7 +546,6 @@ class SortingEnv:
 
             # print every 10 env steps (minimal)
             if (self._env_step % 10) == 0:
-                # also print per-term means so we can see domination
                 sort_term_mean = self._safe_scalar(sort_term)
                 bonus_term_mean = self._safe_scalar(bonus_term)
                 energy_term_mean = self._safe_scalar(energy_term)
@@ -563,7 +580,6 @@ class SortingEnv:
             }
 
             # Full tensor info for debugging: keep torch tensors for array-like data
-            # For entries that are floats, don't call .cpu()
             def _maybe_cpu(x):
                 return x.detach().cpu() if isinstance(x, torch.Tensor) else x
 
