@@ -1,4 +1,3 @@
-# # src/utils/metrics.py
 # import torch
 # import torch.nn.functional as F
 
@@ -33,7 +32,6 @@
 #             coords_list.append(torch.tensor([y, x], device=state.device, dtype=torch.long))
 
 #     # stack patches: list length = N (=H*W), each element (B,C,p,p)
-#     # after stacking: (N, B, C, p, p) -> permute to (B, N, C, p, p)
 #     patches_stack = torch.stack(patches_list, dim=0)        # (N, B, C, p, p)
 #     patches_stack = patches_stack.permute(1, 0, 2, 3, 4)   # (B, N, C, p, p)
 #     patches_stack = patches_stack.contiguous()
@@ -51,28 +49,21 @@
 #         state: (B, C, H, W) where channels include TYPE_A and TYPE_B probabilities
 #     Output:
 #         energy: (B,) per-batch scalar energy (mean magnitude of gradients between types)
-#     Notes:
-#         - This is a generic, stable proxy for interfacial energy: spatial gradient magnitude
-#           of the difference in type probability fields.
 #     """
 #     if state.dim() != 4:
 #         raise ValueError("state must be (B,C,H,W)")
 
-#     # If channels >=2, assume channel 0 corresponds to TYPE_A (compatible with your wrappers).
-#     # Use difference between channel 0 and 1 if present, else use channel 0 alone.
 #     B, C, H, W = state.shape
+#     # If two or more channels, difference of first two channels
 #     if C >= 2:
 #         field = state[:, 0] - state[:, 1]  # (B, H, W)
 #     else:
 #         field = state[:, 0]
 
 #     # compute gradients (finite differences)
-#     # pad=False: compute internal diffs, then compute absolute gradients
 #     dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
 #     dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
 
-#     # average gradient magnitude across space -> energy per batch
-#     # normalize by number of comparisons to keep scale stable across sizes
 #     gx = dx.mean(dim=[1,2]) if dx.numel() > 0 else torch.zeros(B, device=state.device)
 #     gy = dy.mean(dim=[1,2]) if dy.numel() > 0 else torch.zeros(B, device=state.device)
 
@@ -101,20 +92,19 @@
 #     elif actions.dim() == 3:
 #         # ambiguous: (B, N, A) or (B, A, N). Detect by size of last dim
 #         B, x, z = actions.shape
-#         # if last dim small (<=8) assume (B, N, A); else try to be robust
 #         if z <= 8:
+#             # (B, N, A)
 #             mag = actions.pow(2).mean(dim=[1,2])  # (B,)
 #         else:
 #             # treat as (B, A, N)
 #             mag = actions.pow(2).mean(dim=[1,2])
 #     elif actions.dim() == 2:
-#         # (B, A) or (B, N)
 #         mag = actions.pow(2).mean(dim=1)
 #     else:
-#         # fallback: compute global mean and broadcast
 #         mag = actions.pow(2).mean().view(1).repeat(actions.shape[0] if actions.dim() > 0 else 1)
 
 #     return mag
+
 
 import torch
 import torch.nn.functional as F
@@ -180,6 +170,8 @@ def interfacial_energy(state: torch.Tensor, axis_pairs=None):
 
     # compute gradients (finite differences)
     dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
+    dy = torch.abs(field[:, :, 1:, :] - field[:, :, :-1, :]) if field.dim() == 3 else torch.zeros(B, device=state.device)
+    # Above dy fallback is safe because field is (B,H,W). But keep style consistent:
     dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
 
     gx = dx.mean(dim=[1,2]) if dx.numel() > 0 else torch.zeros(B, device=state.device)
@@ -192,33 +184,47 @@ def interfacial_energy(state: torch.Tensor, axis_pairs=None):
 def motion_penalty(actions: torch.Tensor, kind: str = "l2"):
     """
     Motion penalty for actions.
-    Input:
-        actions: either
-            - (B, A, H, W)  (global)
-            - (B, N, A)     (flattened local per-cell actions)
-            - (B, A, N)     (some variants)
-    Output:
-        penalty: (B,) per-batch scalar (mean squared magnitude)
+    Accepts:
+      - (B, A, H, W)  (global)
+      - (B, N, A)     (flattened per-cell actions)
+      - (B, A, N)     (variant)
+    Returns:
+      - penalty: (B,) per-batch scalar (mean squared magnitude)
     """
     if not isinstance(actions, torch.Tensor):
-        actions = torch.tensor(actions)
+        actions = torch.as_tensor(actions)
 
-    # normalize shape into (B, A, H, W) or (B, N, A)
+    # ensure float on same device if possible
+    try:
+        actions = actions.float()
+    except Exception:
+        actions = actions.to(dtype=torch.float32)
+
+    # Case 1: (B, A, H, W)
     if actions.dim() == 4:
-        # (B, A, H, W)
-        mag = actions.pow(2).mean(dim=[1,2,3])   # per-batch mean squared action
-    elif actions.dim() == 3:
-        # ambiguous: (B, N, A) or (B, A, N). Detect by size of last dim
-        B, x, z = actions.shape
-        if z <= 8:
-            # (B, N, A)
-            mag = actions.pow(2).mean(dim=[1,2])  # (B,)
-        else:
-            # treat as (B, A, N)
-            mag = actions.pow(2).mean(dim=[1,2])
-    elif actions.dim() == 2:
-        mag = actions.pow(2).mean(dim=1)
-    else:
-        mag = actions.pow(2).mean().view(1).repeat(actions.shape[0] if actions.dim() > 0 else 1)
+        # per-batch mean squared action
+        mag = actions.pow(2).mean(dim=[1, 2, 3])
+        return mag
 
-    return mag
+    # Case 2: (B, N, A) or (B, A, N)
+    if actions.dim() == 3:
+        B, d1, d2 = actions.shape
+        # If last dim small (e.g. 3), treat as (B, N, A)
+        if d2 <= 8:
+            mag = actions.pow(2).mean(dim=[1, 2])  # (B,)
+            return mag
+        # else, maybe (B, A, N)
+        mag = actions.pow(2).mean(dim=[1, 2])
+        return mag
+
+    # Case 3: (B, K) or other -> mean over all but batch dim
+    if actions.dim() == 2:
+        mag = actions.pow(2).mean(dim=1)
+        return mag
+
+    # Fallback: global mean scalar -> return per-batch repeated value if possible
+    mag_scalar = actions.pow(2).mean()
+    if actions.dim() == 0:
+        return mag_scalar.view(1)
+    B_try = actions.shape[0] if actions.dim() > 0 else 1
+    return mag_scalar.view(1).repeat(B_try)
