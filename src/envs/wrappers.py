@@ -283,7 +283,6 @@
 #     def current_state(self):
 #         return self.state.detach().clone()
 
-
 # wrappers.py
 import torch
 import torch.nn.functional as F
@@ -312,13 +311,13 @@ class SortingEnv:
         self.state = None
 
         # -----------------------------
-        # Final tuned hyperparameters
+        # Tuned hyperparameters (final pass)
         # -----------------------------
-        # Reward shaping coefficients (balanced, less spikey)
-        self.sort_weight   = 300.0    # moderate
-        self.sort_bonus    = 2.0
+        self.sort_weight   = 300.0    # reward weight on delta-based normalized improvement
+        # Use amplified sort_idx as an immediate reward (helps early training)
+        self.sort_bonus    = 50.0     # moderate immediate bonus (was small before)
         self.energy_weight = 1.0
-        self.motion_weight = 0.03     # penalize motion a bit more
+        self.motion_weight = 0.03
         self.reward_clip   = 50.0
         self.term_clip     = 50.0
 
@@ -327,7 +326,7 @@ class SortingEnv:
         self._sort_ema = None
         self._last_sort_idx = None
 
-        # RMS normalizer for pos_delta: stable running RMS
+        # RMS normalizer for pos_delta
         self.pos_delta_rms_alpha = 0.05
         self._pos_delta_rms = None
         self._pos_delta_eps = 1e-6
@@ -473,11 +472,22 @@ class SortingEnv:
 
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)  # (B,)
 
+            # ---------------------------
+            # Fallback: if norm_pos_delta is all zeros (no positive EMA yet),
+            # provide a small immediate signal based on current sort_idx so agent isn't blind.
+            # ---------------------------
+            if torch.all(norm_pos_delta == 0):
+                # small, normalized immediate proxy (keeps units similar)
+                fallback = sort_idx / (torch.sqrt(self._pos_delta_rms + self._pos_delta_eps))
+                # scale very small so it doesn't swamp EMA-based reward later
+                norm_pos_delta = norm_pos_delta + 0.01 * fallback
+
             # -----------------------------------------------------
             # REWARD TERMS
             # -----------------------------------------------------
-            sort_term   = self.sort_weight * norm_pos_delta
-            bonus_term  = self.sort_bonus * raw_sort_idx
+            sort_term   = self.sort_weight * norm_pos_delta            # uses EMA-normalized improvements (or fallback early)
+            # immediate bonus uses amplified sort_idx (clear immediate signal)
+            bonus_term  = self.sort_bonus * sort_idx
             energy_term = -self.energy_weight * e
             motion_term = -self.motion_weight * mpen
 
