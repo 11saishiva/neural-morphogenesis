@@ -162,22 +162,30 @@ def interfacial_energy(state: torch.Tensor, axis_pairs=None):
         raise ValueError("state must be (B,C,H,W)")
 
     B, C, H, W = state.shape
+
     # If two or more channels, difference of first two channels
     if C >= 2:
-        field = state[:, 0] - state[:, 1]  # (B, H, W)
+        # field shape: (B, H, W)
+        field = state[:, 0] - state[:, 1]
     else:
         field = state[:, 0]
 
-    # compute gradients (finite differences)
-    dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
-    dy = torch.abs(field[:, :, 1:, :] - field[:, :, :-1, :]) if field.dim() == 3 else torch.zeros(B, device=state.device)
-    # Above dy fallback is safe because field is (B,H,W). But keep style consistent:
-    dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
+    # compute absolute finite differences along x and y
+    # dx: differences along width (x)
+    if W > 1:
+        dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
+        gx = dx.mean(dim=[1, 2])
+    else:
+        gx = torch.zeros(B, device=state.device, dtype=state.dtype)
 
-    gx = dx.mean(dim=[1,2]) if dx.numel() > 0 else torch.zeros(B, device=state.device)
-    gy = dy.mean(dim=[1,2]) if dy.numel() > 0 else torch.zeros(B, device=state.device)
+    # dy: differences along height (y)
+    if H > 1:
+        dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
+        gy = dy.mean(dim=[1, 2])
+    else:
+        gy = torch.zeros(B, device=state.device, dtype=state.dtype)
 
-    energy = (gx + gy) * 0.5
+    energy = 0.5 * (gx + gy)
     return energy
 
 
