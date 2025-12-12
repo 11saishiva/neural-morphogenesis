@@ -268,9 +268,9 @@ class SortingEnv:
         # --- Reward shaping coefficients: tuned to reduce spike sensitivity ---
         # Reduced sort amplification and weights to avoid huge transient spikes
         self.sort_weight   = 600.0    # was 200.0
-        self.sort_bonus    = 4.0      # keep small
+        self.sort_bonus    = 2.0      # keep small
         self.energy_weight = 1.0
-        self.motion_weight = 0.003
+        self.motion_weight = 0.02
         self.reward_clip   = 50.0
         self.term_clip     = 50.0
 
@@ -425,6 +425,9 @@ class SortingEnv:
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
             norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
+            norm_pos_delta_mean = float(norm_pos_delta.mean().detach().cpu())
+            # include norm_pos_delta_mean in your reward summary / SORT-MA prints
+
 
             # -----------------------------------------------------
             # Moving averages of raw sorting index (diagnostics)
@@ -486,6 +489,7 @@ class SortingEnv:
                 "raw_sort_idx_mean": raw_mean,
                 "sort_idx_mean": _scalar(sort_idx),
                 "pos_delta_mean": _scalar(pos_delta),
+                "norm_pos_delta_mean" : _scalar(norm_pos_delta_mean),
                 "interfacial_energy_mean": _scalar(e),
                 "motion_penalty_mean": _scalar(mpen),
                 "running_scale_mean": _scalar(running_scale),
@@ -503,6 +507,7 @@ class SortingEnv:
                 "delta_sort_index": delta_sort.cpu(),
                 "smoothed_delta": self._sort_ema.cpu(),
                 "pos_delta": pos_delta.cpu(),
+                "norm_pos_delta_mean" : norm_pos_delta_mean.cpu(),
                 "pos_delta_rms": self._pos_delta_rms.cpu(),
                 "running_scale": running_scale.cpu(),
                 "norm_pos_delta": norm_pos_delta.cpu(),
