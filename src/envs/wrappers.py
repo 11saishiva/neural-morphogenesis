@@ -283,7 +283,6 @@
 #     def current_state(self):
 #         return self.state.detach().clone()
 
-# wrappers.py
 import torch
 import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
@@ -306,16 +305,15 @@ class SortingEnv:
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
-        # DCA model
         self.dca = DCA().to(self.device)
         self.state = None
 
         # -----------------------------
-        # Tuned hyperparameters (final pass)
+        # Final tuned hyperparameters
         # -----------------------------
-        self.sort_weight   = 300.0    # reward weight on delta-based normalized improvement
-        # Use amplified sort_idx as an immediate reward (helps early training)
-        self.sort_bonus    = 50.0     # moderate immediate bonus (was small before)
+        self.sort_weight   = 300.0    # reward weight on delta-based improvements (EMA-normalized)
+        # Immediate bonus now small + saturating (see step())
+        self.sort_bonus    = 5.0      # moderate immediate bonus (saturated by tanh)
         self.energy_weight = 1.0
         self.motion_weight = 0.03
         self.reward_clip   = 50.0
@@ -332,9 +330,9 @@ class SortingEnv:
         self._pos_delta_eps = 1e-6
 
         # Sorting index amplification (moderate)
-        self.SORT_AMPLIFY = 500.0
+        self.SORT_AMPLIFY = 200.0
 
-        # Moving averages of raw sorting index (diagnostics)
+        # Moving averages of raw sorting index (for diagnostics)
         self._raw_sort_ma20 = None
         self._raw_sort_ma50 = None
 
@@ -411,6 +409,18 @@ class SortingEnv:
         return torch.abs(left - right)
 
     # ---------------------------------------------------------
+    # safe scalar extractor (handles torch.Tensor or python float)
+    # ---------------------------------------------------------
+    @staticmethod
+    def _safe_scalar(x):
+        if isinstance(x, torch.Tensor):
+            # convert to python float using mean for batched tensors if needed
+            return float(x.detach().cpu().mean())
+        else:
+            # assume it's already a scalar-like float/int
+            return float(x)
+
+    # ---------------------------------------------------------
     # MAIN STEP FUNCTION
     # ---------------------------------------------------------
     def step(self, actions):
@@ -420,21 +430,21 @@ class SortingEnv:
         B = self.state.shape[0]
         self._env_step += 1
 
-        # reshape local actions (expected shape (B, N, A) where N=H*W)
+        # reshape local actions
         if self.obs_mode == 'local':
             N = self.H * self.W
             if actions.dim() != 3 or actions.shape[1] != N:
                 raise ValueError(f"Expected (B, N, A). Got {actions.shape}")
-            # actions: (B, N, A) -> (B, A, H, W)
             actions = actions.transpose(1, 2).reshape(B, -1, self.H, self.W)
 
         with torch.no_grad():
-            # Apply DCA for steps_per_action steps
+            # -------------------
+            # Apply DCA for k steps
+            # -------------------
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
 
-            # update environment state
             self.state = s.detach().clone()
 
             # Compute energy + motion
@@ -443,7 +453,7 @@ class SortingEnv:
 
             # Sorting index
             raw_sort_idx = self._sorting_index(self.state).detach()  # (B,)
-            sort_idx = raw_sort_idx * self.SORT_AMPLIFY
+            sort_idx = raw_sort_idx * self.SORT_AMPLIFY               # (B,)
 
             if self._last_sort_idx is None:
                 delta_sort = torch.zeros_like(sort_idx)
@@ -452,46 +462,53 @@ class SortingEnv:
 
             self._last_sort_idx = sort_idx.detach().clone()
 
-            # EMA of delta-sort: ensure shape matches
+            # EMA of delta-sort
             if self._sort_ema is None or self._sort_ema.shape[0] != sort_idx.shape[0]:
                 self._sort_ema = torch.zeros_like(sort_idx)
 
-            alpha = float(self.sort_ema_alpha)
-            self._sort_ema = (1 - alpha) * self._sort_ema.to(sort_idx.device) + alpha * delta_sort
+            α = float(self.sort_ema_alpha)
+            self._sort_ema = (1 - α) * self._sort_ema.to(sort_idx.device) + α * delta_sort
 
-            pos_delta = torch.relu(self._sort_ema)  # only positive improvements
+            pos_delta = torch.relu(self._sort_ema)
 
-            # RMS normalization for pos_delta
+            # RMS norm
             if self._pos_delta_rms is None or self._pos_delta_rms.shape[0] != pos_delta.shape[0]:
                 self._pos_delta_rms = torch.ones_like(pos_delta)
 
-            beta = float(self.pos_delta_rms_alpha)
+            β = float(self.pos_delta_rms_alpha)
             sq = pos_delta ** 2
-            self._pos_delta_rms = (1 - beta) * self._pos_delta_rms.to(pos_delta.device) + beta * sq
+            self._pos_delta_rms = (1 - β) * self._pos_delta_rms.to(pos_delta.device) + β * sq
             running_scale = torch.sqrt(self._pos_delta_rms + self._pos_delta_eps)
 
-            norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)  # (B,)
+            norm_pos_delta = pos_delta / (running_scale + self._pos_delta_eps)
 
-            # ---------------------------
-            # Fallback: if norm_pos_delta is all zeros (no positive EMA yet),
-            # provide a small immediate signal based on current sort_idx so agent isn't blind.
-            # ---------------------------
-            if torch.all(norm_pos_delta == 0):
-                # small, normalized immediate proxy (keeps units similar)
-                fallback = sort_idx / (torch.sqrt(self._pos_delta_rms + self._pos_delta_eps))
-                # scale very small so it doesn't swamp EMA-based reward later
-                norm_pos_delta = norm_pos_delta + 0.01 * fallback
+            # compute a float mean for logging without breaking tensor shapes
+            norm_pos_delta_mean = self._safe_scalar(norm_pos_delta)
+
+            # -----------------------------------------------------
+            # Moving averages of raw sorting index (diagnostics)
+            # -----------------------------------------------------
+            if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
+                # re-init if batch size changes
+                self._raw_sort_ma20 = raw_sort_idx.clone()
+                self._raw_sort_ma50 = raw_sort_idx.clone()
+            else:
+                alpha20 = 2.0 / (20.0 + 1.0)
+                alpha50 = 2.0 / (50.0 + 1.0)
+                self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
+                self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
 
             # -----------------------------------------------------
             # REWARD TERMS
             # -----------------------------------------------------
-            sort_term   = self.sort_weight * norm_pos_delta            # uses EMA-normalized improvements (or fallback early)
-            # immediate bonus uses amplified sort_idx (clear immediate signal)
-            bonus_term  = self.sort_bonus * sort_idx
-            energy_term = -self.energy_weight * e
-            motion_term = -self.motion_weight * mpen
+            sort_term   = self.sort_weight * norm_pos_delta            # (B,)
+            # immediate bonus uses amplified sort_idx, but apply tanh to avoid runaway constant
+            # use scaled tanh so small sort_idx still gives proportional reward, large values saturate
+            bonus_term = self.sort_bonus * torch.tanh(sort_idx)       # (B,)
+            energy_term = -self.energy_weight * e                     # (B,)
+            motion_term = -self.motion_weight * mpen                  # (B,)
 
-            # Clip per-term to avoid extreme contributions
+            # Clip per-term
             sort_term   = torch.clamp(sort_term, -self.term_clip, self.term_clip)
             bonus_term  = torch.clamp(bonus_term, -self.term_clip, self.term_clip)
             energy_term = torch.clamp(energy_term, -self.term_clip, self.term_clip)
@@ -501,74 +518,76 @@ class SortingEnv:
             reward = reward / float(self.steps_per_action)
             reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
 
-            # -------------------------
-            # Lightweight scalar summaries
-            # -------------------------
-            def _scalar_mean_tensor(x):
-                """Return python float mean of a tensor x."""
-                return float(x.detach().cpu().mean())
+            # -----------------------------------------------------
+            # SCALARS + MINIMAL LOGGING (Option A)
+            # -----------------------------------------------------
+            raw_mean = self._safe_scalar(raw_sort_idx)
+            ma20_mean = self._safe_scalar(self._raw_sort_ma20)
+            ma50_mean = self._safe_scalar(self._raw_sort_ma50)
+            reward_mean = self._safe_scalar(reward)
 
-            raw_mean = _scalar_mean_tensor(raw_sort_idx)
-            ma20_mean = _scalar_mean_tensor(self._raw_sort_ma20) if (self._raw_sort_ma20 is not None) else raw_mean
-            ma50_mean = _scalar_mean_tensor(self._raw_sort_ma50) if (self._raw_sort_ma50 is not None) else raw_mean
-            reward_mean = _scalar_mean_tensor(reward)
-            norm_pos_delta_mean = float(norm_pos_delta.detach().cpu().mean())
-
-            # Update (exponential) moving averages of raw sorting index for diagnostics
-            if (self._raw_sort_ma20 is None) or (self._raw_sort_ma20.shape[0] != raw_sort_idx.shape[0]):
-                self._raw_sort_ma20 = raw_sort_idx.clone()
-                self._raw_sort_ma50 = raw_sort_idx.clone()
-            else:
-                alpha20 = 2.0 / (20.0 + 1.0)
-                alpha50 = 2.0 / (50.0 + 1.0)
-                self._raw_sort_ma20 = (1.0 - alpha20) * self._raw_sort_ma20 + alpha20 * raw_sort_idx
-                self._raw_sort_ma50 = (1.0 - alpha50) * self._raw_sort_ma50 + alpha50 * raw_sort_idx
-
-            # Minimal console logging every 10 env steps
+            # print every 10 env steps (minimal)
             if (self._env_step % 10) == 0:
+                # also print per-term means so we can see domination
+                sort_term_mean = self._safe_scalar(sort_term)
+                bonus_term_mean = self._safe_scalar(bonus_term)
+                energy_term_mean = self._safe_scalar(energy_term)
+                motion_term_mean = self._safe_scalar(motion_term)
+
                 print(
                     f"[SORT-MA] step={self._env_step} "
                     f"raw={raw_mean:.6e} ma20={ma20_mean:.6e} ma50={ma50_mean:.6e} "
-                    f"reward_mean={reward_mean:.6f} norm_pos_delta={norm_pos_delta_mean:.6e}",
+                    f"reward_mean={reward_mean:.6f} norm_pos_delta={norm_pos_delta_mean:.6e} "
+                    f"sort_term_mean={sort_term_mean:.6f} bonus_mean={bonus_term_mean:.6f} "
+                    f"energy_mean={energy_term_mean:.6f} motion_mean={motion_term_mean:.6f}",
                     flush=True,
                 )
 
-            # Reward components (small python floats) for easy logging / monitoring
+            # Pack reward components as python scalars (for convenient logging)
             reward_components = {
                 "reward_mean": reward_mean,
-                "sort_term_mean": _scalar_mean_tensor(sort_term),
-                "bonus_term_mean": _scalar_mean_tensor(bonus_term),
-                "energy_term_mean": _scalar_mean_tensor(energy_term),
-                "motion_term_mean": _scalar_mean_tensor(motion_term),
+                "sort_term_mean": self._safe_scalar(sort_term),
+                "bonus_term_mean": self._safe_scalar(bonus_term),
+                "energy_term_mean": self._safe_scalar(energy_term),
+                "motion_term_mean": self._safe_scalar(motion_term),
                 "raw_sort_idx_mean": raw_mean,
-                "sort_idx_mean": float(sort_idx.detach().cpu().mean()),
-                "pos_delta_mean": float(pos_delta.detach().cpu().mean()),
+                "sort_idx_mean": self._safe_scalar(sort_idx),
+                "pos_delta_mean": self._safe_scalar(pos_delta),
                 "norm_pos_delta_mean": norm_pos_delta_mean,
-                "interfacial_energy_mean": _scalar_mean_tensor(e),
-                "motion_penalty_mean": _scalar_mean_tensor(mpen),
-                "running_scale_mean": float(running_scale.detach().cpu().mean()),
+                "interfacial_energy_mean": self._safe_scalar(e),
+                "motion_penalty_mean": self._safe_scalar(mpen),
+                "running_scale_mean": self._safe_scalar(running_scale),
                 "raw_sort_ma20_mean": ma20_mean,
                 "raw_sort_ma50_mean": ma50_mean,
                 "steps_per_action": float(self.steps_per_action),
             }
 
-            # Info: keep only small CPU tensors and scalar summaries
+            # Full tensor info for debugging: keep torch tensors for array-like data
+            # For entries that are floats, don't call .cpu()
+            def _maybe_cpu(x):
+                return x.detach().cpu() if isinstance(x, torch.Tensor) else x
+
             info = {
-                "interfacial_energy": e.detach().cpu(),        # (B,)
-                "motion_penalty": mpen.detach().cpu(),         # (B,)
-                "raw_sort_index": raw_sort_idx.detach().cpu(), # (B,)
-                "sort_index": sort_idx.detach().cpu(),         # (B,)
-                "delta_sort_index": delta_sort.detach().cpu(),
-                "smoothed_delta": self._sort_ema.detach().cpu(),
-                # scalar summaries to avoid heavy transfers
-                "norm_pos_delta_mean": norm_pos_delta_mean,
-                "pos_delta_rms": self._pos_delta_rms.detach().cpu(),
-                "running_scale": running_scale.detach().cpu(),
+                "interfacial_energy": _maybe_cpu(e),
+                "motion_penalty": _maybe_cpu(mpen),
+                "raw_sort_index": _maybe_cpu(raw_sort_idx),
+                "sort_index": _maybe_cpu(sort_idx),
+                "delta_sort_index": _maybe_cpu(delta_sort),
+                "smoothed_delta": _maybe_cpu(self._sort_ema),
+                "pos_delta": _maybe_cpu(pos_delta),
+                "norm_pos_delta": _maybe_cpu(norm_pos_delta),
+                "pos_delta_rms": _maybe_cpu(self._pos_delta_rms),
+                "running_scale": _maybe_cpu(running_scale),
+                "sort_term": _maybe_cpu(sort_term),
+                "bonus_term": _maybe_cpu(bonus_term),
+                "energy_term": _maybe_cpu(energy_term),
+                "motion_term": _maybe_cpu(motion_term),
+                "raw_sort_ma20": _maybe_cpu(self._raw_sort_ma20),
+                "raw_sort_ma50": _maybe_cpu(self._raw_sort_ma50),
                 "reward_components": reward_components,
             }
 
-        # Return observation, CPU reward tensor, and light info dict
-        return self.get_observation(), reward.detach().cpu(), info
+        return self.get_observation(), reward.detach(), info
 
     # ---------------------------------------------------------
     def current_state(self):
