@@ -385,26 +385,84 @@ class SortingEnv:
     # ---------------------------------------------------
     # Reset
     # ---------------------------------------------------
+    # def reset(self, B=1, pA=0.5):
+    #     types = torch.rand(B, 2, self.H, self.W, device=self.device)
+    #     types = F.softmax(types, dim=1)
+
+    #     types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
+    #     types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1.0 - pA)
+    #     types = F.softmax(types, dim=1)
+
+    #     adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
+    #     morphogen = torch.linspace(0, 1, self.W, device=self.device).view(1, 1, 1, self.W)
+    #     morphogen = morphogen.repeat(B, 1, self.H, 1)
+    #     center = torch.ones(B, 1, self.H, self.W, device=self.device)
+
+    #     self.state = torch.cat([types, adhesion, morphogen, center], dim=1).detach()
+
+    #     with torch.no_grad():
+    #         self._last_purity = self._interface_purity(self.state)
+
+    #     self._env_step = 0
+    #     return self.get_observation()
     def reset(self, B=1, pA=0.5):
-        types = torch.rand(B, 2, self.H, self.W, device=self.device)
+        """
+        Non-trivial reset:
+        - Creates spatially mixed blobs
+        - Initial purity ~0.5
+        - High interfacial complexity
+        """
+
+        device = self.device
+
+        # --- Create coarse checkerboard blobs ---
+        yy, xx = torch.meshgrid(
+            torch.linspace(0, 1, self.H, device=device),
+            torch.linspace(0, 1, self.W, device=device),
+            indexing="ij"
+        )
+
+        # Low-frequency pattern (blobs, not pixels)
+        freq = 3.0
+        pattern = torch.sin(freq * torch.pi * xx) * torch.sin(freq * torch.pi * yy)
+        pattern = pattern.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+
+        # Random phase per batch
+        phase = torch.rand(B, 1, 1, 1, device=device) * 2 * torch.pi
+        pattern = torch.sin(freq * torch.pi * xx + phase) * torch.sin(freq * torch.pi * yy + phase)
+        pattern = pattern.unsqueeze(1)  # (B,1,H,W)
+
+        # Convert pattern → probabilities
+        noise = 0.05 * torch.randn_like(pattern)
+        logits_A = pattern + noise
+        logits_B = -pattern + noise
+
+        types = torch.cat([logits_A, logits_B], dim=1)
         types = F.softmax(types, dim=1)
 
-        types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
-        types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1.0 - pA)
-        types = F.softmax(types, dim=1)
+        # --- Adhesion: heterogeneous but bounded ---
+        adhesion = 0.4 + 0.2 * torch.rand(B, 1, self.H, self.W, device=device)
 
-        adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
-        morphogen = torch.linspace(0, 1, self.W, device=self.device).view(1, 1, 1, self.W)
-        morphogen = morphogen.repeat(B, 1, self.H, 1)
-        center = torch.ones(B, 1, self.H, self.W, device=self.device)
+        # --- Morphogen & center ---
+        morphogen = self._make_morphogen(B)
+        center = torch.ones(B, 1, self.H, self.W, device=device)
 
         self.state = torch.cat([types, adhesion, morphogen, center], dim=1).detach()
 
+        # --- Reset trackers ---
+        self._sort_ema = torch.zeros(B, device=device)
+        self._pos_delta_rms = torch.ones(B, device=device)
+        self._norm_pos_delta_ema = torch.zeros(B, device=device)
+
         with torch.no_grad():
-            self._last_purity = self._interface_purity(self.state)
+            raw = self._sorting_index(self.state)
+            self._last_sort_idx = raw * self.SORT_AMPLIFY
+            self._raw_sort_ma20 = raw.clone()
+            self._raw_sort_ma50 = raw.clone()
 
         self._env_step = 0
         return self.get_observation()
+
 
     # ---------------------------------------------------
     def get_observation(self):
