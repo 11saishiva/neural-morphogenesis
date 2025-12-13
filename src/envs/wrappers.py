@@ -401,23 +401,23 @@ class SortingEnv:
     def reset(self, B=1, pA=0.5):
         device = self.device
 
+        # create spatial pattern (NO batch here)
         yy, xx = torch.meshgrid(
-            torch.linspace(0, 1, self.H, device=device),
-            torch.linspace(0, 1, self.W, device=device),
-            indexing="ij",
+            torch.linspace(0, 1, self.H, device=self.device),
+            torch.linspace(0, 1, self.W, device=self.device),
+            indexing="ij"
         )
 
-        freq = 3.0
-        phase = torch.rand(B, 1, 1, 1, device=device) * 2 * torch.pi
+        freq = torch.randint(2, 5, (1,), device=self.device).item()
+        phase = torch.rand(1, device=self.device) * 2 * torch.pi
+
         pattern = torch.sin(freq * torch.pi * xx + phase) * torch.sin(
             freq * torch.pi * yy + phase
-        )
+        )                      # (H, W)
+
+        # expand to batch
         pattern = pattern.unsqueeze(0).repeat(B, 1, 1)   # (B, H, W)
         pattern = pattern.unsqueeze(1)                   # (B, 1, H, W)
-        print(self.state.shape)
-
-
-
         noise = 0.05 * torch.randn_like(pattern)
         logits_A = pattern + noise
         logits_B = -pattern + noise
