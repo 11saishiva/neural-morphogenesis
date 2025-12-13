@@ -176,7 +176,7 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
-        gamma_motion=0.01,
+        gamma_motion=0.002,
         steps_per_action=1,
         obs_mode="local",
     ):
@@ -191,7 +191,7 @@ class SortingEnv:
         self.state = None
 
         # reward weights
-        self.purity_delta_weight = 1.0
+        self.purity_delta_weight = 1000.0
         self.purity_anchor_weight = 0.05
         self.energy_weight = 1.0
         self.motion_weight = gamma_motion
