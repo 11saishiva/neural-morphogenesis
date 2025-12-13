@@ -414,6 +414,8 @@ class SortingEnv:
         )
         pattern = pattern.unsqueeze(0).repeat(B, 1, 1)   # (B, H, W)
         pattern = pattern.unsqueeze(1)                   # (B, 1, H, W)
+        print(self.state.shape)
+
 
 
         noise = 0.05 * torch.randn_like(pattern)
