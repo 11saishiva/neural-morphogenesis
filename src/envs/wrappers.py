@@ -493,6 +493,17 @@ class SortingEnv:
         return self.get_observation(), reward, info
 
     # ---------------------------------------------------
+    def _sorting_index(self, state):
+        """
+        Legacy left-right sorting index.
+        Used by train_local_sorting.py for logging/eval.
+        """
+        A = state[:, TYPE_A]  # (B, H, W)
+        mid = self.W // 2
+        left = A[:, :, :mid].mean(dim=[1, 2])
+        right = A[:, :, mid:].mean(dim=[1, 2])
+        return torch.abs(left - right)
+
     def current_state(self):
         return self.state.clone()
 
