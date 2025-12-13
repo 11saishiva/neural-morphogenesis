@@ -14,7 +14,7 @@
 #         raise ValueError("state must be (B,C,H,W)")
 
 #     B, C, H, W = state.shape
-#     p = int(patch_size)
+#     p = patch_size
 #     pad = p // 2
 
 #     # pad to allow extracting patches at borders
@@ -23,15 +23,19 @@
 #     patches_list = []
 #     coords_list = []
 
-#     # iterate spatially; H and W are expected to be modest (e.g. 32..128)
+#     # iterate spatially (H small enough typically)
 #     for y in range(H):
 #         for x in range(W):
-#             patch = padded[:, :, y:(y + p), x:(x + p)].clone().contiguous()  # (B, C, p, p)
+#             # slice returns contiguous only if we clone; clone -> contiguous copy
+#             patch = padded[:, :, y:(y+p), x:(x+p)].clone().contiguous()  # (B, C, p, p)
 #             patches_list.append(patch)
 #             coords_list.append(torch.tensor([y, x], device=state.device, dtype=torch.long))
 
-#     # stack patches: (N, B, C, p, p) -> permute -> (B, N, C, p, p)
-#     patches_stack = torch.stack(patches_list, dim=0).permute(1, 0, 2, 3, 4).contiguous()
+#     # stack patches: list length = N (=H*W), each element (B,C,p,p)
+#     patches_stack = torch.stack(patches_list, dim=0)        # (N, B, C, p, p)
+#     patches_stack = patches_stack.permute(1, 0, 2, 3, 4)   # (B, N, C, p, p)
+#     patches_stack = patches_stack.contiguous()
+
 #     coords = torch.stack(coords_list, dim=0)               # (N, 2)
 #     coords = coords.unsqueeze(0).repeat(B, 1, 1)           # (B, N, 2)
 
@@ -40,102 +44,81 @@
 
 # def interfacial_energy(state: torch.Tensor, axis_pairs=None):
 #     """
-#     Robust interfacial energy estimator.
-
+#     Simple interfacial energy estimator.
 #     Input:
-#       state: (B, C, H, W) where channels include type probabilities (e.g. TYPE_A, TYPE_B)
+#         state: (B, C, H, W) where channels include TYPE_A and TYPE_B probabilities
 #     Output:
-#       energy: (B,) per-batch scalar energy (mean magnitude of gradients between types)
-#     Notes:
-#       - Handles edge cases H==1 or W==1 safely.
-#       - Returns float tensor on same device/dtype as input.
+#         energy: (B,) per-batch scalar energy (mean magnitude of gradients between types)
 #     """
 #     if state.dim() != 4:
 #         raise ValueError("state must be (B,C,H,W)")
 
 #     B, C, H, W = state.shape
-#     device = state.device
-#     dtype = state.dtype
-
-#     # derive the scalar field: difference of first two channels if present
+#     # If two or more channels, difference of first two channels
 #     if C >= 2:
-#         # shape -> (B, H, W)
+#         # field shape (B, H, W)
 #         field = state[:, 0] - state[:, 1]
 #     else:
 #         field = state[:, 0]
 
-#     # dx: differences along width axis (x)
+#     # compute gradients (finite differences) carefully
+#     # dx: differences along width (x), dy: differences along height (y)
 #     if W > 1:
 #         dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
-#         gx = dx.mean(dim=[1, 2])  # (B,)
+#         gx = dx.mean(dim=[1, 2]) if dx.numel() > 0 else torch.zeros(B, device=state.device)
 #     else:
-#         gx = torch.zeros(B, device=device, dtype=dtype)
+#         gx = torch.zeros(B, device=state.device)
 
-#     # dy: differences along height axis (y)
 #     if H > 1:
 #         dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
-#         gy = dy.mean(dim=[1, 2])  # (B,)
+#         gy = dy.mean(dim=[1, 2]) if dy.numel() > 0 else torch.zeros(B, device=state.device)
 #     else:
-#         gy = torch.zeros(B, device=device, dtype=dtype)
+#         gy = torch.zeros(B, device=state.device)
 
-#     energy = 0.5 * (gx + gy)
+#     energy = (gx + gy) * 0.5
 #     return energy
 
 
 # def motion_penalty(actions: torch.Tensor, kind: str = "l2"):
 #     """
 #     Motion penalty for actions.
-#     Accepts:
-#         - (B, A, H, W)  global actions
-#         - (B, N, A)     flattened per-cell actions
-#         - (B, A, N)     variant
-#         - (B, K)        fallback
-#     Returns:
-#         - penalty: (B,) per-batch scalar (mean squared magnitude)
+#     Input:
+#         actions: either
+#             - (B, A, H, W)  (global)
+#             - (B, N, A)     (flattened local per-cell actions)
+#             - (B, A, N)     (some variants)
+#     Output:
+#         penalty: (B,) per-batch scalar (mean squared magnitude)
 #     """
 #     if not isinstance(actions, torch.Tensor):
-#         actions = torch.as_tensor(actions)
+#         actions = torch.tensor(actions)
 
-#     # ensure float dtype
-#     actions = actions.float()
-
-#     # Case: global (B, A, H, W)
+#     # normalize shape into (B, A, H, W) or (B, N, A)
 #     if actions.dim() == 4:
-#         return actions.pow(2).mean(dim=[1, 2, 3])
+#         # (B, A, H, W)
+#         mag = actions.pow(2).mean(dim=[1,2,3])   # per-batch mean squared action
+#     elif actions.dim() == 3:
+#         # ambiguous: (B, N, A) or (B, A, N). Detect by size of last dim
+#         B_, x, z = actions.shape
+#         if z <= 8:
+#             # (B, N, A)
+#             mag = actions.pow(2).mean(dim=[1,2])  # (B,)
+#         else:
+#             # treat as (B, A, N)
+#             mag = actions.pow(2).mean(dim=[1,2])
+#     elif actions.dim() == 2:
+#         mag = actions.pow(2).mean(dim=1)
+#     else:
+#         # fallback: mean over all elements
+#         mag = actions.pow(2).mean().view(1).repeat(actions.shape[0] if actions.dim() > 0 else 1)
 
-#     # Case: (B, N, A) or (B, A, N)
-#     if actions.dim() == 3:
-#         B = actions.shape[0]
-#         d1, d2 = actions.shape[1], actions.shape[2]
-#         # heuristics: if last dim small (<=8) treat as (B, N, A)
-#         if d2 <= 8:
-#             return actions.pow(2).mean(dim=[1, 2])
-#         return actions.pow(2).mean(dim=[1, 2])
-
-#     # Case: (B, K)
-#     if actions.dim() == 2:
-#         return actions.pow(2).mean(dim=1)
-
-#     # Scalar or unknown -> return scalar repeated per-batch if possible
-#     mag = actions.pow(2).mean()
-#     if actions.dim() == 0:
-#         return mag.view(1)
-#     # try derive a batch dim, else return single-value tensor
-#     B_try = actions.shape[0] if actions.dim() > 0 else 1
-#     return mag.view(1).repeat(B_try)
+#     return mag
 
 import torch
 import torch.nn.functional as F
 
+
 def extract_local_patches(state: torch.Tensor, patch_size: int = 5):
-    """
-    Safe patch extractor (no as_strided).
-    Input:
-        state: (B, C, H, W)
-    Output:
-        patches: (B, H*W, C, patch_size, patch_size)  -- contiguous
-        coords:  (B, H*W, 2)                           -- int coords (y,x)
-    """
     if state.dim() != 4:
         raise ValueError("state must be (B,C,H,W)")
 
@@ -143,99 +126,49 @@ def extract_local_patches(state: torch.Tensor, patch_size: int = 5):
     p = patch_size
     pad = p // 2
 
-    # pad to allow extracting patches at borders
-    padded = F.pad(state, (pad, pad, pad, pad), mode="reflect")  # (B, C, H+2pad, W+2pad)
+    padded = F.pad(state, (pad, pad, pad, pad), mode="reflect")
 
-    patches_list = []
-    coords_list = []
+    patches = []
+    coords = []
 
-    # iterate spatially (H small enough typically)
     for y in range(H):
         for x in range(W):
-            # slice returns contiguous only if we clone; clone -> contiguous copy
-            patch = padded[:, :, y:(y+p), x:(x+p)].clone().contiguous()  # (B, C, p, p)
-            patches_list.append(patch)
-            coords_list.append(torch.tensor([y, x], device=state.device, dtype=torch.long))
+            patch = padded[:, :, y:y+p, x:x+p].clone().contiguous()
+            patches.append(patch)
+            coords.append(torch.tensor([y, x], device=state.device))
 
-    # stack patches: list length = N (=H*W), each element (B,C,p,p)
-    patches_stack = torch.stack(patches_list, dim=0)        # (N, B, C, p, p)
-    patches_stack = patches_stack.permute(1, 0, 2, 3, 4)   # (B, N, C, p, p)
-    patches_stack = patches_stack.contiguous()
+    patches = torch.stack(patches, dim=0).permute(1, 0, 2, 3, 4).contiguous()
+    coords = torch.stack(coords, dim=0).unsqueeze(0).repeat(B, 1, 1)
 
-    coords = torch.stack(coords_list, dim=0)               # (N, 2)
-    coords = coords.unsqueeze(0).repeat(B, 1, 1)           # (B, N, 2)
-
-    return patches_stack, coords
+    return patches, coords
 
 
-def interfacial_energy(state: torch.Tensor, axis_pairs=None):
+def interface_purity(state: torch.Tensor):
     """
-    Simple interfacial energy estimator.
-    Input:
-        state: (B, C, H, W) where channels include TYPE_A and TYPE_B probabilities
-    Output:
-        energy: (B,) per-batch scalar energy (mean magnitude of gradients between types)
+    Measures local interface sharpness.
+    Higher = purer (neighbors are same type).
     """
     if state.dim() != 4:
         raise ValueError("state must be (B,C,H,W)")
 
-    B, C, H, W = state.shape
-    # If two or more channels, difference of first two channels
-    if C >= 2:
-        # field shape (B, H, W)
-        field = state[:, 0] - state[:, 1]
-    else:
-        field = state[:, 0]
+    pA = state[:, 0:1]  # (B,1,H,W)
 
-    # compute gradients (finite differences) carefully
-    # dx: differences along width (x), dy: differences along height (y)
-    if W > 1:
-        dx = torch.abs(field[:, :, 1:] - field[:, :, :-1])   # (B, H, W-1)
-        gx = dx.mean(dim=[1, 2]) if dx.numel() > 0 else torch.zeros(B, device=state.device)
-    else:
-        gx = torch.zeros(B, device=state.device)
+    dx = torch.abs(pA[:, :, :, 1:] - pA[:, :, :, :-1])
+    dy = torch.abs(pA[:, :, 1:, :] - pA[:, :, :-1, :])
 
-    if H > 1:
-        dy = torch.abs(field[:, 1:, :] - field[:, :-1, :])   # (B, H-1, W)
-        gy = dy.mean(dim=[1, 2]) if dy.numel() > 0 else torch.zeros(B, device=state.device)
-    else:
-        gy = torch.zeros(B, device=state.device)
+    diff = torch.cat([dx.flatten(1), dy.flatten(1)], dim=1)
+    purity = 1.0 - diff.mean(dim=1)
 
-    energy = (gx + gy) * 0.5
-    return energy
+    return purity
 
 
-def motion_penalty(actions: torch.Tensor, kind: str = "l2"):
-    """
-    Motion penalty for actions.
-    Input:
-        actions: either
-            - (B, A, H, W)  (global)
-            - (B, N, A)     (flattened local per-cell actions)
-            - (B, A, N)     (some variants)
-    Output:
-        penalty: (B,) per-batch scalar (mean squared magnitude)
-    """
+def motion_penalty(actions: torch.Tensor):
     if not isinstance(actions, torch.Tensor):
         actions = torch.tensor(actions)
 
-    # normalize shape into (B, A, H, W) or (B, N, A)
     if actions.dim() == 4:
-        # (B, A, H, W)
-        mag = actions.pow(2).mean(dim=[1,2,3])   # per-batch mean squared action
+        return actions.pow(2).mean(dim=[1, 2, 3])
     elif actions.dim() == 3:
-        # ambiguous: (B, N, A) or (B, A, N). Detect by size of last dim
-        B_, x, z = actions.shape
-        if z <= 8:
-            # (B, N, A)
-            mag = actions.pow(2).mean(dim=[1,2])  # (B,)
-        else:
-            # treat as (B, A, N)
-            mag = actions.pow(2).mean(dim=[1,2])
-    elif actions.dim() == 2:
-        mag = actions.pow(2).mean(dim=1)
+        return actions.pow(2).mean(dim=[1, 2])
     else:
-        # fallback: mean over all elements
-        mag = actions.pow(2).mean().view(1).repeat(actions.shape[0] if actions.dim() > 0 else 1)
-
-    return mag
+        return actions.pow(2).mean().unsqueeze(0)
