@@ -346,24 +346,21 @@ class SortingEnv:
         self,
         H=64,
         W=64,
-        device="cpu",
+        device='cpu',
+        gamma_motion=0.01,          # ← restored for compatibility
         steps_per_action=6,
-        obs_mode="local",
+        obs_mode='local'
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
+
+        # keep for backward compatibility (even if unused)
+        self.gamma_motion = float(gamma_motion)
+
         self.steps_per_action = steps_per_action
+        assert obs_mode in ('local', 'global')
         self.obs_mode = obs_mode
 
-        self.dca = DCA().to(self.device)
-        self.state = None
-
-        # reward weights (minimal, interpretable)
-        self.purity_weight = 5.0
-        self.motion_weight = 0.02
-
-        self._last_purity = None
-        self._env_step = 0
 
     def reset(self, B=1, pA=0.5):
         types = torch.rand(B, 2, self.H, self.W, device=self.device)
