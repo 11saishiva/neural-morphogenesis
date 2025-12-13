@@ -293,7 +293,6 @@ class SortingEnv:
                 - self.motion_weight * motion
             )
 
-            reward = reward.mean()
 
             if self._env_step % 10 == 0:
                 print(
