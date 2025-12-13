@@ -353,6 +353,8 @@ class SortingEnv:
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
+        self.dca = DCA().to(self.device)
+
 
         # keep for backward compatibility (even if unused)
         self.gamma_motion = float(gamma_motion)
