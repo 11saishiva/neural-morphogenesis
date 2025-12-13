@@ -292,6 +292,12 @@ class SortingEnv:
                 - self.energy_weight * energy
                 - self.motion_weight * motion
             )
+            # curriculum: slowly reduce purity amplification
+            self.purity_delta_weight = max(
+                50.0,
+                self.purity_delta_weight * 0.9995
+            )
+
 
 
             if self._env_step % 10 == 0:
