@@ -624,6 +624,10 @@ def main():
         # print normalized reward estimate from normalizer (for debugging)
         print(f"[{update:04d}] reward={mean_r:.6f} (norm estimate={reward_normalizer.running_mean:.6f}/{math.sqrt(reward_normalizer.running_var):.6f}) | "
               f"energy={mean_e:.6f} | motion={mean_m:.6f} | sort_idx={sorting_idx:.6f}")
+        # NEW ADD ON
+        purity = env._sorting_index(env.current_state()).mean().item()
+        print("initial purity:", purity)
+
 
         if update % SAVE_CHECKPOINT_EVERY == 0:
             ckpt_path = f"checkpoints/ppo_{update:04d}.pt"
