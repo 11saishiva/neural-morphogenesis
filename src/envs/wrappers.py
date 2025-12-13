@@ -336,14 +336,14 @@
 
 import torch
 import torch.nn.functional as F
-from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-from ..utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+
+from .dca import DCA, TYPE_A, TYPE_B
+from src.utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
 
 class SortingEnv:
     """
-    Sorting environment with interface-purity-based reward.
-    Fully self-contained. No dangling attributes.
+    Stable sorting environment with non-trivial initialization.
     """
 
     def __init__(
@@ -357,82 +357,63 @@ class SortingEnv:
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
-        self.gamma_motion = float(gamma_motion)
-        self.steps_per_action = int(steps_per_action)
+        self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
-        # ------------------------
-        # Dynamics
-        # ------------------------
+        # dynamics
         self.dca = DCA().to(self.device)
-        self.state = None
 
-        # ------------------------
-        # Reward weights (Option A)
-        # ------------------------
-        self.purity_weight = 8.0        # MAIN signal
+        # reward weights (unchanged)
+        self.sort_weight = 300.0
+        self.sort_bonus = 3.0
         self.energy_weight = 1.0
-        self.motion_weight = 0.01
+        self.motion_weight = gamma_motion
 
-        self.reward_clip = 20.0
+        self.SORT_AMPLIFY = 80.0
 
-        # ------------------------
-        # Tracking
-        # ------------------------
-        self._last_purity = None
+        # trackers
+        self._last_sort_idx = None
+        self._sort_ema = None
+        self._pos_delta_rms = None
+        self._norm_pos_delta_ema = None
         self._env_step = 0
 
-    # ---------------------------------------------------
-    # Reset
-    # ---------------------------------------------------
-    # def reset(self, B=1, pA=0.5):
-    #     types = torch.rand(B, 2, self.H, self.W, device=self.device)
-    #     types = F.softmax(types, dim=1)
+        self.state = None
 
-    #     types[:, TYPE_A] = types[:, TYPE_A] * 0.5 + pA
-    #     types[:, TYPE_B] = types[:, TYPE_B] * 0.5 + (1.0 - pA)
-    #     types = F.softmax(types, dim=1)
+    # ------------------------------------------------------------------
+    # helpers (THESE WERE MISSING — now restored)
+    # ------------------------------------------------------------------
+    def _make_morphogen(self, B):
+        x = torch.linspace(0, 1, self.W, device=self.device)
+        x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
+        return x
 
-    #     adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
-    #     morphogen = torch.linspace(0, 1, self.W, device=self.device).view(1, 1, 1, self.W)
-    #     morphogen = morphogen.repeat(B, 1, self.H, 1)
-    #     center = torch.ones(B, 1, self.H, self.W, device=self.device)
+    def _sorting_index(self, state):
+        A = state[:, TYPE_A]  # (B,H,W)
+        mid = self.W // 2
+        left = A[:, :, :mid].mean(dim=[1, 2])
+        right = A[:, :, mid:].mean(dim=[1, 2])
+        return torch.abs(left - right)
 
-    #     self.state = torch.cat([types, adhesion, morphogen, center], dim=1).detach()
-
-    #     with torch.no_grad():
-    #         self._last_purity = self._interface_purity(self.state)
-
-    #     self._env_step = 0
-    #     return self.get_observation()
+    # ------------------------------------------------------------------
+    # reset (Option 1: non-trivial task)
+    # ------------------------------------------------------------------
     def reset(self, B=1, pA=0.5):
-        """
-        Non-trivial reset:
-        - Creates spatially mixed blobs
-        - Initial purity ~0.5
-        - High interfacial complexity
-        """
-
         device = self.device
 
-        # --- Create coarse checkerboard blobs ---
         yy, xx = torch.meshgrid(
             torch.linspace(0, 1, self.H, device=device),
             torch.linspace(0, 1, self.W, device=device),
-            indexing="ij"
+            indexing="ij",
         )
 
-        # Low-frequency pattern (blobs, not pixels)
         freq = 3.0
-        pattern = torch.sin(freq * torch.pi * xx) * torch.sin(freq * torch.pi * yy)
-        pattern = pattern.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-        # Random phase per batch
         phase = torch.rand(B, 1, 1, 1, device=device) * 2 * torch.pi
-        pattern = torch.sin(freq * torch.pi * xx + phase) * torch.sin(freq * torch.pi * yy + phase)
+        pattern = torch.sin(freq * torch.pi * xx + phase) * torch.sin(
+            freq * torch.pi * yy + phase
+        )
         pattern = pattern.unsqueeze(1)  # (B,1,H,W)
 
-        # Convert pattern → probabilities
         noise = 0.05 * torch.randn_like(pattern)
         logits_A = pattern + noise
         logits_B = -pattern + noise
@@ -440,16 +421,13 @@ class SortingEnv:
         types = torch.cat([logits_A, logits_B], dim=1)
         types = F.softmax(types, dim=1)
 
-        # --- Adhesion: heterogeneous but bounded ---
         adhesion = 0.4 + 0.2 * torch.rand(B, 1, self.H, self.W, device=device)
-
-        # --- Morphogen & center ---
         morphogen = self._make_morphogen(B)
         center = torch.ones(B, 1, self.H, self.W, device=device)
 
         self.state = torch.cat([types, adhesion, morphogen, center], dim=1).detach()
 
-        # --- Reset trackers ---
+        # trackers
         self._sort_ema = torch.zeros(B, device=device)
         self._pos_delta_rms = torch.ones(B, device=device)
         self._norm_pos_delta_ema = torch.zeros(B, device=device)
@@ -457,51 +435,24 @@ class SortingEnv:
         with torch.no_grad():
             raw = self._sorting_index(self.state)
             self._last_sort_idx = raw * self.SORT_AMPLIFY
-            self._raw_sort_ma20 = raw.clone()
-            self._raw_sort_ma50 = raw.clone()
 
         self._env_step = 0
         return self.get_observation()
 
-
-    # ---------------------------------------------------
+    # ------------------------------------------------------------------
     def get_observation(self):
         if self.obs_mode == "global":
             return self.state.clone()
         patches, coords = extract_local_patches(self.state, patch_size=5)
         return patches, coords
 
-    # ---------------------------------------------------
-    # Interface purity metric
-    # ---------------------------------------------------
-    def _interface_purity(self, state):
-        """
-        Measures how clean interfaces are.
-        High when neighboring cells are same type.
-        """
-        diff = torch.abs(state[:, TYPE_A] - state[:, TYPE_B])  # (B,H,W)
-
-        dx = torch.abs(diff[:, :, 1:] - diff[:, :, :-1])
-        dy = torch.abs(diff[:, 1:, :] - diff[:, :-1, :])
-
-        purity = 1.0 - 0.5 * (dx.mean(dim=[1, 2]) + dy.mean(dim=[1, 2]))
-        return purity.clamp(0.0, 1.0)
-
-    # ---------------------------------------------------
-    # Step
-    # ---------------------------------------------------
+    # ------------------------------------------------------------------
     def step(self, actions):
-        if self.state is None:
-            raise RuntimeError("Call reset() before step().")
-
         B = self.state.shape[0]
         self._env_step += 1
 
-        # reshape actions
         if self.obs_mode == "local":
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
-
-        actions = actions.to(self.device)
 
         with torch.no_grad():
             s = self.state
@@ -509,59 +460,33 @@ class SortingEnv:
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-            # --------------------
-            # Purity reward
-            # --------------------
-            purity = self._interface_purity(self.state)
-            delta_purity = purity - self._last_purity
-            self._last_purity = purity.clone()
+            e = interfacial_energy(self.state)
+            m = motion_penalty(actions)
 
-            purity_reward = self.purity_weight * delta_purity
+            raw = self._sorting_index(self.state)
+            sort_idx = raw * self.SORT_AMPLIFY
+            delta = sort_idx - self._last_sort_idx
+            self._last_sort_idx = sort_idx.clone()
 
-            # --------------------
-            # Regularization
-            # --------------------
-            energy = interfacial_energy(self.state)
-            motion = motion_penalty(actions)
+            pos = torch.relu(delta)
 
             reward = (
-                purity_reward
-                - self.energy_weight * energy
-                - self.motion_weight * motion
+                self.sort_weight * pos
+                + self.sort_bonus * raw
+                - self.energy_weight * e
+                - self.motion_weight * m
             )
+            reward = reward / self.steps_per_action
 
-            reward = torch.clamp(reward, -self.reward_clip, self.reward_clip)
+        info = {
+            "raw_sort_index": raw.cpu(),
+            "sort_index": sort_idx.cpu(),
+            "interfacial_energy": e.cpu(),
+            "motion_penalty": m.cpu(),
+        }
 
-            if self._env_step % 10 == 0:
-                print(
-                    f"[ENV] step={self._env_step} "
-                    f"purity={purity.mean():.4f} "
-                    f"Δpurity={delta_purity.mean():+.4e} "
-                    f"reward={reward.mean():+.4f}",
-                    flush=True,
-                )
+        return self.get_observation(), reward.detach(), info
 
-            info = {
-                "purity": purity.cpu(),
-                "delta_purity": delta_purity.cpu(),
-                "energy": energy.cpu(),
-                "motion": motion.cpu(),
-            }
-
-        return self.get_observation(), reward, info
-
-    # ---------------------------------------------------
-    def _sorting_index(self, state):
-        """
-        Legacy left-right sorting index.
-        Used by train_local_sorting.py for logging/eval.
-        """
-        A = state[:, TYPE_A]  # (B, H, W)
-        mid = self.W // 2
-        left = A[:, :, :mid].mean(dim=[1, 2])
-        right = A[:, :, mid:].mean(dim=[1, 2])
-        return torch.abs(left - right)
-
+    # ------------------------------------------------------------------
     def current_state(self):
         return self.state.clone()
-
