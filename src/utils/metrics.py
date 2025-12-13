@@ -172,3 +172,17 @@ def motion_penalty(actions: torch.Tensor):
         return actions.pow(2).mean(dim=[1, 2])
     else:
         return actions.pow(2).mean().unsqueeze(0)
+def interfacial_energy(state: torch.Tensor):
+    """
+    Backward-compatible alias.
+
+    Previously: higher energy = worse interface
+    Now: we define energy = 1 - interface_purity
+
+    This preserves:
+      - training script imports
+      - logging expectations
+      - reward sign conventions
+    """
+    purity = interface_purity(state)
+    return 1.0 - purity
