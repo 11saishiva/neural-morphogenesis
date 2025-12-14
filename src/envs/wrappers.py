@@ -182,6 +182,31 @@ import torch.nn.functional as F
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
 from src.utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
+class RunningMeanStd:
+    def __init__(self, eps=1e-4, device="cpu"):
+        self.mean = torch.zeros(1, device=device)
+        self.var = torch.ones(1, device=device)
+        self.count = eps
+
+    def update(self, x):
+        batch_mean = x.mean()
+        batch_var = x.var(unbiased=False)
+        batch_count = x.numel()
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+
+        self.mean = new_mean
+        self.var = M2 / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / torch.sqrt(self.var + 1e-8)
 
 class SortingEnv:
     """
@@ -208,6 +233,7 @@ class SortingEnv:
         # dynamics
         self.dca = DCA().to(self.device)
         self.state = None
+        self.reward_rms = RunningMeanStd(device=self.device)
 
         # reward weights
         self.purity_delta_weight = 1000.0
@@ -318,13 +344,15 @@ class SortingEnv:
             energy = interfacial_energy(self.state)
             motion = motion_penalty(actions)
 
-            reward = (
+            raw_reward = (
                 self.purity_delta_weight * delta_purity
                 + self.purity_anchor_weight * purity
                 - self.energy_weight * energy
                 - self.motion_weight * motion
             )
 
+            self.reward_rms.update(raw_reward)
+            reward = self.reward_rms.normalize(raw_reward)
             # curriculum decay
             self.purity_delta_weight = max(
                 50.0, self.purity_delta_weight * 0.9995
