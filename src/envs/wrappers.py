@@ -324,6 +324,20 @@ class SortingEnv:
     def step(self, actions):
         B = self.state.shape[0]
         self._env_step += 1
+        # scale actions to adhesion modulation
+        adh = self.state[:, ADH:ADH+1]
+        adh = torch.clamp(
+            adh + 0.5 * actions[:, 0:1],   # << STRONG coupling
+            0.05,
+            1.0
+        )
+
+        self.state = torch.cat([
+            self.state[:, :ADH],
+            adh,
+            self.state[:, ADH+1:]
+        ], dim=1)
+
 
         # reshape local actions
         if actions.dim() == 3:
