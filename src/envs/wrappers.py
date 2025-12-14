@@ -369,18 +369,32 @@ class SortingEnv:
         # --------------------------------------------------------------
         # rewards
         # --------------------------------------------------------------
-        mixing = local_interface_mixing(self.state)
-        delta_mixing = self.prev_mixing - mixing
-        self.prev_mixing = mixing.detach()
+        # mixing = local_interface_mixing(self.state)
+        # delta_mixing = self.prev_mixing - mixing
+        # self.prev_mixing = mixing.detach()
 
-        energy = interfacial_energy(self.state)
-        motion = motion_penalty(actions)
+        # energy = interfacial_energy(self.state)
+        # motion = motion_penalty(actions)
+
+        # reward = (
+        #     self.mixing_weight * delta_mixing
+        #     - self.energy_weight * energy
+        #     - self.motion_weight * motion
+        # )
+        # directional sorting signal (weak)
+        A = self.state[:, TYPE_A]            # (B,H,W)
+        x = torch.linspace(-1, 1, self.W, device=self.device)
+        x = x.view(1, 1, 1, self.W)
+
+        directional_bias = (A * x).mean(dim=[1,2,3])
 
         reward = (
             self.mixing_weight * delta_mixing
+            + 0.5 * directional_bias          # <<< ADD THIS
             - self.energy_weight * energy
             - self.motion_weight * motion
         )
+
 
         if self._env_step % 10 == 0:
             print(
