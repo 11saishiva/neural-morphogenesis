@@ -197,40 +197,40 @@
 #     # ------------------------------------------------------------------
 #     def current_state(self):
 #         return self.state.clone()
-
 import torch
 import torch.nn.functional as F
 
-from src.envs.dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-from src.utils.metrics import (
-    interfacial_energy,
-    motion_penalty,
-    extract_local_patches,
-)
+from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
+from src.utils.metrics import extract_local_patches
+
 
 # ---------------------------------------------------------------------
-# helpers
+# Mixing metric (local interface density)
 # ---------------------------------------------------------------------
 def local_interface_mixing(state):
     """
-    Scalar interface mixing proxy.
-    Expects state shape: (B, C, H, W)
+    Measures A/B interface density.
+    state: (B, C, H, W)
     """
-    A = state[:, TYPE_A]  # (B,H,W)
-    dx = torch.abs(A[:, :, 1:] - A[:, :, :-1]).mean(dim=[1, 2])
-    dy = torch.abs(A[:, 1:, :] - A[:, :-1, :]).mean(dim=[1, 2])
-    return dx + dy
+    A = state[:, TYPE_A]  # (B, H, W)
+
+    dx = torch.abs(A[:, :, 1:] - A[:, :, :-1])
+    dy = torch.abs(A[:, 1:, :] - A[:, :-1, :])
+
+    mixing = dx.mean(dim=(1, 2)) + dy.mean(dim=(1, 2))
+    return mixing
 
 
 # ---------------------------------------------------------------------
-# Environment
+# Sorting Environment
 # ---------------------------------------------------------------------
 class SortingEnv:
     """
-    Robust sorting environment with:
-    - stochastic structured init
-    - hybrid local observations
-    - action → adhesion control (strong)
+    Stable morphogenetic sorting environment with:
+    - stochastic init
+    - hybrid observation
+    - mixing-based reward
+    - temporal persistence bonus
     """
 
     def __init__(
@@ -238,204 +238,142 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
-        gamma_motion=0.01,
         steps_per_action=1,
-        obs_mode="local",
+        obs_mode="local",   # "local" or "hybrid"
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
-
-        self.gamma_motion = gamma_motion
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
+        # dynamics
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # reward weights (stable defaults)
+        # reward weights (matched to your logs)
+        self.mixing_weight = 2.0
         self.energy_weight = 1.0
-        self.motion_weight = gamma_motion
-        self.mixing_weight = 5.0
+        self.motion_weight = 0.05
+        self.persistence_weight = 0.002
 
         # bookkeeping
         self.prev_mixing = None
+        self.sorted_steps = None
         self._env_step = 0
 
-    # ------------------------------------------------------------------
-    # metrics
-    # ------------------------------------------------------------------
-    def _sorting_index(self, state):
-        """
-        Global left–right segregation metric.
-        """
-        A = state[:, TYPE_A]  # (B,H,W)
-        mid = self.W // 2
-        left = A[:, :, :mid].mean(dim=[1, 2])
-        right = A[:, :, mid:].mean(dim=[1, 2])
-        return torch.abs(left - right)
-
-    # ------------------------------------------------------------------
-    # reset
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Reset
+    # -----------------------------------------------------------------
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
-        # smooth spatial noise
+        # stochastic low-frequency bias
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
+        noise = torch.tanh(noise)
 
-        # orientation bias
-        if torch.rand(1).item() < 0.5:
-            bias = torch.linspace(-1, 1, self.W, device=self.device)
-            bias = bias.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
-        else:
-            bias = torch.linspace(-1, 1, self.H, device=self.device)
-            bias = bias.view(1, 1, self.H, 1).repeat(B, 1, 1, self.W)
+        # directional morphogen
+        morphogen = torch.linspace(0, 1, self.W, device=self.device)
+        morphogen = morphogen.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
 
-        logits = 0.7 * noise + 0.7 * bias
+        logits = 0.7 * noise + 0.6 * (morphogen - 0.5)
         probA = torch.sigmoid(logits)
 
-        types = torch.cat([probA, 1 - probA], dim=1)
+        types = torch.cat([probA, 1.0 - probA], dim=1)
         types = F.softmax(types, dim=1)
 
-        adhesion = torch.full(
-            (B, 1, self.H, self.W),
-            0.5,
-            device=self.device,
-        )
-
-        morphogen = torch.linspace(
-            0, 1, self.W, device=self.device
-        ).view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
-
+        adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
 
         self.state = torch.cat(
             [types, adhesion, morphogen, center], dim=1
         ).detach()
 
-        self.prev_mixing = local_interface_mixing(self.state).detach()
+        self.prev_mixing = local_interface_mixing(self.state)
+        self.sorted_steps = torch.zeros_like(self.prev_mixing)
 
-        if self.obs_mode == "local":
-            return extract_local_patches(self.state, patch_size=5)
-        else:
-            return self.state.clone()
+        return self._get_obs()
 
-    # ------------------------------------------------------------------
-    # step
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Step
+    # -----------------------------------------------------------------
     def step(self, actions):
-        """
-        actions:
-          local mode -> (B, N, 3)
-          global mode -> (B, 3, H, W)
-        """
         B = self.state.shape[0]
         self._env_step += 1
 
-        if self.obs_mode == "local":
+        # local → full grid
+        if self.obs_mode in ["local", "hybrid"]:
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
         actions = actions.to(self.device)
 
-        # --------------------------------------------------------------
-        # 🔥 CRITICAL: action → adhesion coupling
-        # --------------------------------------------------------------
-        adh = self.state[:, ADH:ADH + 1]
-        adh = torch.clamp(
-            adh + 0.5 * actions[:, 0:1],  # strong control
-            0.05,
-            1.0,
-        )
-
-        self.state = torch.cat(
-            [
-                self.state[:, :ADH],
-                adh,
-                self.state[:, ADH + 1 :],
-            ],
-            dim=1,
-        )
-
-        # --------------------------------------------------------------
-        # DCA rollout
-        # --------------------------------------------------------------
         with torch.no_grad():
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-        # persistent sorting bonus
-        if not hasattr(self, "sorted_steps"):
-            self.sorted_steps = torch.zeros_like(sort_idx)
+            # ----------------------------------------------------------
+            # metrics
+            # ----------------------------------------------------------
+            mixing = local_interface_mixing(self.state)
+            delta_mixing = self.prev_mixing - mixing
+            self.prev_mixing = mixing.clone()
 
-        threshold = 0.001  # empirically correct from your logs
+            # temporal persistence (CRITICAL)
+            threshold = 9e-4
+            is_sorted = (mixing < threshold).float()
+            self.sorted_steps = is_sorted * (self.sorted_steps + 1)
 
-        is_sorted = (sort_idx > threshold).float()
-        self.sorted_steps = is_sorted * (self.sorted_steps + 1)
+            persistence_bonus = self.persistence_weight * self.sorted_steps
 
-        persistence_bonus = 0.002 * self.sorted_steps
+            energy = (self.state[:, ADH] ** 2).mean(dim=(1, 2))
+            motion = actions.abs().mean(dim=(1, 2, 3))
 
-
-        # --------------------------------------------------------------
-        # rewards
-        # --------------------------------------------------------------
-        mixing = local_interface_mixing(self.state)
-        delta_mixing = self.prev_mixing - mixing
-        self.prev_mixing = mixing.detach()
-
-        energy = interfacial_energy(self.state)
-        motion = motion_penalty(actions)
-
-    
-        # directional sorting signal (weak)
-        A = self.state[:, TYPE_A]            # (B,H,W)
-        x = torch.linspace(-1, 1, self.W, device=self.device)
-        x = x.view(1, 1, 1, self.W)
-
-        directional_bias = (A * x).mean(dim=[1,2,3])
-
-        # reward = (
-        #     self.mixing_weight * delta_mixing
-        #     + 0.5 * directional_bias          # <<< ADD THIS
-        #     - self.energy_weight * energy
-        #     - self.motion_weight * motion
-        # )
-        reward = (
-            self.mixing_weight * delta_mixing
-            + 0.5 * directional_bias
-            + persistence_bonus
-            - self.energy_weight * energy
-            - self.motion_weight * motion
-        )
-
-
-
-        if self._env_step % 10 == 0:
-            print(
-                f"[ENV] step={self._env_step} "
-                f"mixing={mixing.mean():.4e} "
-                f"gain={delta_mixing.mean():+.4e} "
-                f"reward={reward.mean():+.4f}",
-                flush=True,
+            # ----------------------------------------------------------
+            # reward
+            # ----------------------------------------------------------
+            reward = (
+                self.mixing_weight * delta_mixing
+                + persistence_bonus
+                - self.energy_weight * energy
+                - self.motion_weight * motion
             )
 
-        info = {
-            "mixing": mixing.detach().cpu(),
-            "delta_mixing": delta_mixing.detach().cpu(),
-            "energy": energy.detach().cpu(),
-            "motion": motion.detach().cpu(),
-            "sort_idx": self._sorting_index(self.state).detach().cpu(),
-        }
+            if self._env_step % 10 == 0:
+                print(
+                    f"[ENV] step={self._env_step} "
+                    f"mixing={mixing.mean():.4e} "
+                    f"gain={delta_mixing.mean():+.4e} "
+                    f"reward={reward.mean():+.4f}",
+                    flush=True,
+                )
 
+            info = {
+                "mixing": mixing.detach().cpu(),
+                "delta_mixing": delta_mixing.detach().cpu(),
+                "sorted_steps": self.sorted_steps.detach().cpu(),
+                "energy": energy.detach().cpu(),
+                "motion": motion.detach().cpu(),
+            }
+
+        return self._get_obs(), reward, info
+
+    # -----------------------------------------------------------------
+    # Observation
+    # -----------------------------------------------------------------
+    def _get_obs(self):
         if self.obs_mode == "local":
-            obs = extract_local_patches(self.state, patch_size=5)
-        else:
-            obs = self.state.clone()
+            return extract_local_patches(self.state, patch_size=5)
 
-        return obs, reward, info
+        if self.obs_mode == "hybrid":
+            patches, coords = extract_local_patches(self.state, patch_size=5)
+            global_mean = self.state.mean(dim=(2, 3), keepdim=True)
+            return (patches, coords, global_mean)
 
-    # ------------------------------------------------------------------
+        return self.state.clone()
+
+    # -----------------------------------------------------------------
     def current_state(self):
         return self.state.clone()
+
