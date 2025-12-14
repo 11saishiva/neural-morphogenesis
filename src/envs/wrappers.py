@@ -295,6 +295,7 @@ class SortingEnv:
 
         with torch.no_grad():
             self.prev_purity = self._sorting_index(self.state)
+            self.initial_purity = self.prev_purity.clone()
 
         return self._get_observation()
 
@@ -338,7 +339,15 @@ class SortingEnv:
             self.state = s.detach()
 
             purity = self._sorting_index(self.state)
-            delta_purity = purity - self.prev_purity
+            # normalized purity gain
+            purity_gain = (purity - self.initial_purity)
+
+            raw_reward = (
+                5.0 * purity_gain           # <-- strong, dense signal
+                - self.energy_weight * energy
+                - self.motion_weight * motion
+            )
+
             self.prev_purity = purity.clone()
 
             energy = interfacial_energy(self.state)
