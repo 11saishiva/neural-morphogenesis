@@ -267,6 +267,20 @@ class SortingEnv:
         x = torch.linspace(0, 1, self.W, device=self.device)
         x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
         return x
+    def _sorting_index(self, state):
+        """
+        Global left–right sorting metric.
+        Higher = better separation.
+        Returns: (B,)
+        """
+        A = state[:, TYPE_A]   # (B, H, W)
+
+        mid = A.shape[-1] // 2
+        left = A[:, :, :mid].mean(dim=[1, 2])
+        right = A[:, :, mid:].mean(dim=[1, 2])
+
+        return torch.abs(left - right)
+
 
     # ----------------------------------------------------------
     # reset (stochastic but structured)
