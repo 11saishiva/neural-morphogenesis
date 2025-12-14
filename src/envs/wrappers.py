@@ -369,12 +369,12 @@ class SortingEnv:
         # --------------------------------------------------------------
         # rewards
         # --------------------------------------------------------------
-        # mixing = local_interface_mixing(self.state)
-        # delta_mixing = self.prev_mixing - mixing
-        # self.prev_mixing = mixing.detach()
+        mixing = local_interface_mixing(self.state)
+        delta_mixing = self.prev_mixing - mixing
+        self.prev_mixing = mixing.detach()
 
-        # energy = interfacial_energy(self.state)
-        # motion = motion_penalty(actions)
+        energy = interfacial_energy(self.state)
+        motion = motion_penalty(actions)
 
         # reward = (
         #     self.mixing_weight * delta_mixing
