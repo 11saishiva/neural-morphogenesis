@@ -1,17 +1,39 @@
 # import torch
 # import torch.nn.functional as F
 # from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-# from src.utils.metrics import (
-#     interfacial_energy,
-#     motion_penalty,
-#     extract_local_patches,
-# )
+# from src.utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
 
+# class RunningMeanStd:
+#     def __init__(self, eps=1e-4, device="cpu"):
+#         self.mean = torch.zeros(1, device=device)
+#         self.var = torch.ones(1, device=device)
+#         self.count = eps
+
+#     def update(self, x):
+#         batch_mean = x.mean()
+#         batch_var = x.var(unbiased=False)
+#         batch_count = x.numel()
+
+#         delta = batch_mean - self.mean
+#         tot_count = self.count + batch_count
+
+#         new_mean = self.mean + delta * batch_count / tot_count
+#         m_a = self.var * self.count
+#         m_b = batch_var * batch_count
+#         M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+
+#         self.mean = new_mean
+#         self.var = M2 / tot_count
+#         self.count = tot_count
+
+#     def normalize(self, x):
+#         return (x - self.mean) / torch.sqrt(self.var + 1e-8)
 
 # class SortingEnv:
 #     """
-#     Sorting environment with stochastic-but-structured initialization.
-#     Option 3: stochastic per episode, non-trivial task.
+#     Sorting environment with HYBRID observation:
+#     local patches + broadcasted global purity channel.
+#     Fully compatible with train_local_sorting.py (unchanged).
 #     """
 
 #     def __init__(
@@ -32,9 +54,10 @@
 #         # dynamics
 #         self.dca = DCA().to(self.device)
 #         self.state = None
+#         self.reward_rms = RunningMeanStd(device=self.device)
 
-#         # reward weights (SAFE INITIAL VALUES)
-#         self.purity_delta_weight = 50.0     # << FIX 1: sane scale
+#         # reward weights
+#         self.purity_delta_weight = 1000.0
 #         self.purity_anchor_weight = 0.05
 #         self.energy_weight = 1.0
 #         self.motion_weight = gamma_motion
@@ -59,7 +82,7 @@
 #         return torch.abs(left - right)
 
 #     # ------------------------------------------------------------------
-#     # reset (Option 3: stochastic per episode)
+#     # reset (stochastic per episode)
 #     # ------------------------------------------------------------------
 #     def reset(self, B=1, pA=0.5):
 #         self._env_step = 0
@@ -91,14 +114,31 @@
 #             [types, adhesion, morphogen, center], dim=1
 #         ).detach()
 
-#         # purity baseline
 #         with torch.no_grad():
 #             self.prev_purity = self._sorting_index(self.state)
+#             self.initial_purity = self.prev_purity.clone()
 
-#         if self.obs_mode == "local":
-#             return extract_local_patches(self.state, patch_size=5)
-#         else:
+#         return self._get_observation()
+
+#     # ------------------------------------------------------------------
+#     # HYBRID OBSERVATION
+#     # ------------------------------------------------------------------
+#     def _get_observation(self):
+#         if self.obs_mode != "local":
 #             return self.state.clone()
+
+#         patches, coords = extract_local_patches(self.state, patch_size=5)
+#         # patches: (B, N, C, P, P)
+
+#         with torch.no_grad():
+#             purity = self._sorting_index(self.state)  # (B,)
+#             purity = purity.view(-1, 1, 1, 1, 1)
+
+#         B, N, _, P, _ = patches.shape
+#         purity_channel = purity.expand(B, N, 1, P, P)
+
+#         patches = torch.cat([patches, purity_channel], dim=2)
+#         return patches, coords
 
 #     # ------------------------------------------------------------------
 #     # step
@@ -119,59 +159,40 @@
 #                 s = self.dca(s, actions, steps=1)
 #             self.state = s.detach()
 
-#             # purity
+#             # --- purity ---
 #             purity = self._sorting_index(self.state)
-#             delta_purity = purity - self.prev_purity
-#             self.prev_purity = purity.clone()
 
-#             # penalties
+#             # baseline-relative shaping (CORRECT)
+#             purity_gain = purity - self.initial_purity
+
+#             # --- penalties (YOU MUST COMPUTE THESE) ---
 #             energy = interfacial_energy(self.state)
 #             motion = motion_penalty(actions)
 
-#             # -----------------------------
-#             # reward (SAFE + CLAMPED)
-#             # -----------------------------
-#             purity_term = torch.clamp(
-#                 self.purity_delta_weight * delta_purity,
-#                 -1.0,
-#                 1.0,
-#             )
-
+#             # --- reward ---
 #             reward = (
-#                 purity_term
-#                 + self.purity_anchor_weight * purity
+#                 5.0 * purity_gain
 #                 - self.energy_weight * energy
 #                 - self.motion_weight * motion
-#             )
-
-#             # curriculum: gentle decay, never below 50
-#             self.purity_delta_weight = max(
-#                 50.0,
-#                 self.purity_delta_weight * 0.9995
 #             )
 
 #             if self._env_step % 10 == 0:
 #                 print(
 #                     f"[ENV] step={self._env_step} "
-#                     f"purity={purity.mean():.4f} "
-#                     f"Δpurity={delta_purity.mean():+.4e} "
-#                     f"reward={reward.mean().item():.4f}",
+#                     f"purity={purity.mean():.4e} "
+#                     f"gain={purity_gain.mean():+.4e} "
+#                     f"reward={reward.mean().item():+.4f}",
 #                     flush=True,
 #                 )
 
 #             info = {
 #                 "purity": purity.detach().cpu(),
-#                 "delta_purity": delta_purity.detach().cpu(),
+#                 "purity_gain": purity_gain.detach().cpu(),
 #                 "energy": energy.detach().cpu(),
 #                 "motion": motion.detach().cpu(),
 #             }
 
-#         if self.obs_mode == "local":
-#             obs = extract_local_patches(self.state, patch_size=5)
-#         else:
-#             obs = self.state.clone()
-
-#         return obs, reward, info
+#         return self._get_observation(), reward, info
 
 #     # ------------------------------------------------------------------
 #     def current_state(self):
@@ -179,40 +200,37 @@
 
 import torch
 import torch.nn.functional as F
+
 from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-from src.utils.metrics import interfacial_energy, motion_penalty, extract_local_patches
+from src.utils.metrics import extract_local_patches
 
-class RunningMeanStd:
-    def __init__(self, eps=1e-4, device="cpu"):
-        self.mean = torch.zeros(1, device=device)
-        self.var = torch.ones(1, device=device)
-        self.count = eps
 
-    def update(self, x):
-        batch_mean = x.mean()
-        batch_var = x.var(unbiased=False)
-        batch_count = x.numel()
+# ============================================================
+# Local interface mixing metric (DENSE, LOCAL, PPO-FRIENDLY)
+# ============================================================
+def local_interface_mixing(state):
+    """
+    Measures local A–B interface density.
+    Lower is better.
+    Returns: (B,)
+    """
+    A = state[:, TYPE_A]  # (B,H,W)
 
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
+    dx = torch.abs(A[:, :, :, 1:] - A[:, :, :, :-1])
+    dy = torch.abs(A[:, :, 1:, :] - A[:, :, :-1, :])
 
-        new_mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+    return dx.mean(dim=[1, 2]) + dy.mean(dim=[1, 2])
 
-        self.mean = new_mean
-        self.var = M2 / tot_count
-        self.count = tot_count
 
-    def normalize(self, x):
-        return (x - self.mean) / torch.sqrt(self.var + 1e-8)
-
+# ============================================================
+# Sorting Environment (FINAL)
+# ============================================================
 class SortingEnv:
     """
-    Sorting environment with HYBRID observation:
-    local patches + broadcasted global purity channel.
-    Fully compatible with train_local_sorting.py (unchanged).
+    Local-sorting morphogenesis environment with
+    - stochastic structured init
+    - hybrid observations
+    - dense local interface reward
     """
 
     def __init__(
@@ -220,58 +238,46 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
-        gamma_motion=0.002,
         steps_per_action=1,
-        obs_mode="local",
+        obs_mode="hybrid",   # local + global channels
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
-        self.gamma_motion = gamma_motion
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
         # dynamics
         self.dca = DCA().to(self.device)
         self.state = None
-        self.reward_rms = RunningMeanStd(device=self.device)
 
-        # reward weights
-        self.purity_delta_weight = 1000.0
-        self.purity_anchor_weight = 0.05
-        self.energy_weight = 1.0
-        self.motion_weight = gamma_motion
+        # reward weights (CRITICAL: tuned for scale)
+        self.interface_weight = 2.0
+        self.motion_weight = 0.1
 
         # bookkeeping
-        self.prev_purity = None
         self._env_step = 0
+        self.prev_mixing = None
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # helpers
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     def _make_morphogen(self, B):
         x = torch.linspace(0, 1, self.W, device=self.device)
         x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
         return x
 
-    def _sorting_index(self, state):
-        A = state[:, TYPE_A]  # (B,H,W)
-        mid = self.W // 2
-        left = A[:, :, :mid].mean(dim=[1, 2])
-        right = A[:, :, mid:].mean(dim=[1, 2])
-        return torch.abs(left - right)
-
-    # ------------------------------------------------------------------
-    # reset (stochastic per episode)
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # reset (stochastic, structured)
+    # ----------------------------------------------------------
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
-        # low-frequency spatial noise
+        # smooth spatial noise
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
         noise = torch.tanh(noise)
 
-        # random orientation bias
+        # random global bias direction
         if torch.rand(1).item() < 0.5:
             bias = torch.linspace(-1, 1, self.W, device=self.device)
             bias = bias.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
@@ -279,7 +285,7 @@ class SortingEnv:
             bias = torch.linspace(-1, 1, self.H, device=self.device)
             bias = bias.view(1, 1, self.H, 1).repeat(B, 1, 1, self.W)
 
-        logits = 0.8 * noise + 0.6 * bias
+        logits = 0.7 * noise + 0.6 * bias
         probA = torch.sigmoid(logits)
 
         types = torch.cat([probA, 1.0 - probA], dim=1)
@@ -294,40 +300,19 @@ class SortingEnv:
         ).detach()
 
         with torch.no_grad():
-            self.prev_purity = self._sorting_index(self.state)
-            self.initial_purity = self.prev_purity.clone()
+            self.prev_mixing = local_interface_mixing(self.state)
 
-        return self._get_observation()
+        return self._get_obs()
 
-    # ------------------------------------------------------------------
-    # HYBRID OBSERVATION
-    # ------------------------------------------------------------------
-    def _get_observation(self):
-        if self.obs_mode != "local":
-            return self.state.clone()
-
-        patches, coords = extract_local_patches(self.state, patch_size=5)
-        # patches: (B, N, C, P, P)
-
-        with torch.no_grad():
-            purity = self._sorting_index(self.state)  # (B,)
-            purity = purity.view(-1, 1, 1, 1, 1)
-
-        B, N, _, P, _ = patches.shape
-        purity_channel = purity.expand(B, N, 1, P, P)
-
-        patches = torch.cat([patches, purity_channel], dim=2)
-        return patches, coords
-
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     # step
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     def step(self, actions):
         B = self.state.shape[0]
         self._env_step += 1
 
         # reshape actions if local
-        if self.obs_mode == "local":
+        if actions.dim() == 3:
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
         actions = actions.to(self.device)
@@ -338,41 +323,49 @@ class SortingEnv:
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-            # --- purity ---
-            purity = self._sorting_index(self.state)
+            # ---------------- reward ----------------
+            mixing = local_interface_mixing(self.state)
+            mixing_gain = self.prev_mixing - mixing
+            self.prev_mixing = mixing.clone()
 
-            # baseline-relative shaping (CORRECT)
-            purity_gain = purity - self.initial_purity
+            motion = actions.abs().mean(dim=[1, 2, 3])
 
-            # --- penalties (YOU MUST COMPUTE THESE) ---
-            energy = interfacial_energy(self.state)
-            motion = motion_penalty(actions)
-
-            # --- reward ---
             reward = (
-                5.0 * purity_gain
-                - self.energy_weight * energy
+                self.interface_weight * mixing_gain
                 - self.motion_weight * motion
             )
 
             if self._env_step % 10 == 0:
                 print(
                     f"[ENV] step={self._env_step} "
-                    f"purity={purity.mean():.4e} "
-                    f"gain={purity_gain.mean():+.4e} "
-                    f"reward={reward.mean().item():+.4f}",
+                    f"mixing={mixing.mean():.4e} "
+                    f"gain={mixing_gain.mean():+.4e} "
+                    f"reward={reward.mean():+.4f}",
                     flush=True,
                 )
 
             info = {
-                "purity": purity.detach().cpu(),
-                "purity_gain": purity_gain.detach().cpu(),
-                "energy": energy.detach().cpu(),
+                "mixing": mixing.detach().cpu(),
+                "mixing_gain": mixing_gain.detach().cpu(),
                 "motion": motion.detach().cpu(),
             }
 
-        return self._get_observation(), reward, info
+        return self._get_obs(), reward, info
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # hybrid observation
+    # ----------------------------------------------------------
+    def _get_obs(self):
+        if self.obs_mode == "local":
+            return extract_local_patches(self.state, patch_size=5)
+
+        if self.obs_mode == "global":
+            return self.state.clone()
+
+        # HYBRID (recommended)
+        patches, coords = extract_local_patches(self.state, patch_size=5)
+        return patches, coords
+
+    # ----------------------------------------------------------
     def current_state(self):
         return self.state.clone()
