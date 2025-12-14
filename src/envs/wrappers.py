@@ -205,7 +205,7 @@ from src.utils.metrics import extract_local_patches
 
 
 # ---------------------------------------------------------------------
-# Mixing metric (local interface density)
+# Mixing metric
 # ---------------------------------------------------------------------
 def local_interface_mixing(state):
     """
@@ -217,8 +217,7 @@ def local_interface_mixing(state):
     dx = torch.abs(A[:, :, 1:] - A[:, :, :-1])
     dy = torch.abs(A[:, 1:, :] - A[:, :-1, :])
 
-    mixing = dx.mean(dim=(1, 2)) + dy.mean(dim=(1, 2))
-    return mixing
+    return dx.mean(dim=(1, 2)) + dy.mean(dim=(1, 2))
 
 
 # ---------------------------------------------------------------------
@@ -226,11 +225,8 @@ def local_interface_mixing(state):
 # ---------------------------------------------------------------------
 class SortingEnv:
     """
-    Stable morphogenetic sorting environment with:
-    - stochastic init
-    - hybrid observation
-    - mixing-based reward
-    - temporal persistence bonus
+    Morphogenetic sorting environment
+    (fully compatible with train_local_sorting.py)
     """
 
     def __init__(
@@ -238,8 +234,9 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
+        gamma_motion=0.01,          # <-- REQUIRED FIX
         steps_per_action=1,
-        obs_mode="local",   # "local" or "hybrid"
+        obs_mode="local",           # "local" or "hybrid"
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
@@ -250,10 +247,10 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # reward weights (matched to your logs)
+        # reward weights
         self.mixing_weight = 2.0
         self.energy_weight = 1.0
-        self.motion_weight = 0.05
+        self.motion_weight = gamma_motion     # <-- mapped correctly
         self.persistence_weight = 0.002
 
         # bookkeeping
@@ -267,12 +264,11 @@ class SortingEnv:
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
-        # stochastic low-frequency bias
+        # low-frequency stochastic init
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
         noise = torch.tanh(noise)
 
-        # directional morphogen
         morphogen = torch.linspace(0, 1, self.W, device=self.device)
         morphogen = morphogen.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
 
@@ -301,7 +297,7 @@ class SortingEnv:
         B = self.state.shape[0]
         self._env_step += 1
 
-        # local → full grid
+        # reshape local actions
         if self.obs_mode in ["local", "hybrid"]:
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
@@ -320,7 +316,7 @@ class SortingEnv:
             delta_mixing = self.prev_mixing - mixing
             self.prev_mixing = mixing.clone()
 
-            # temporal persistence (CRITICAL)
+            # persistence
             threshold = 9e-4
             is_sorted = (mixing < threshold).float()
             self.sorted_steps = is_sorted * (self.sorted_steps + 1)
@@ -376,4 +372,3 @@ class SortingEnv:
     # -----------------------------------------------------------------
     def current_state(self):
         return self.state.clone()
-
