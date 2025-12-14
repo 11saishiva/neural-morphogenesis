@@ -201,37 +201,36 @@
 import torch
 import torch.nn.functional as F
 
-from .dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
-from src.utils.metrics import extract_local_patches
+from src.envs.dca import DCA, TYPE_A, TYPE_B, ADH, MORPH, CENTER
+from src.utils.metrics import (
+    interfacial_energy,
+    motion_penalty,
+    extract_local_patches,
+)
 
-
-# ============================================================
-# Local interface mixing metric (dense, local, PPO-aligned)
-# ============================================================
+# ---------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------
 def local_interface_mixing(state):
     """
-    Measures local A–B interface density.
-    Lower is better.
-    Returns: (B,)
+    Scalar interface mixing proxy.
+    Expects state shape: (B, C, H, W)
     """
-    A = state[:, TYPE_A]   # (B, H, W)
-
-    dx = torch.abs(A[:, :, 1:] - A[:, :, :-1])   # horizontal edges
-    dy = torch.abs(A[:, 1:, :] - A[:, :-1, :])   # vertical edges
-
-    return dx.mean(dim=[1, 2]) + dy.mean(dim=[1, 2])
+    A = state[:, TYPE_A]  # (B,H,W)
+    dx = torch.abs(A[:, :, 1:] - A[:, :, :-1]).mean(dim=[1, 2])
+    dy = torch.abs(A[:, 1:, :] - A[:, :-1, :]).mean(dim=[1, 2])
+    return dx + dy
 
 
-
-# ============================================================
-# Sorting Environment
-# ============================================================
+# ---------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------
 class SortingEnv:
     """
-    Local-sorting morphogenesis environment with:
-    - stochastic structured initialization
-    - hybrid/local/global observations
-    - dense local interface reward
+    Robust sorting environment with:
+    - stochastic structured init
+    - hybrid local observations
+    - action → adhesion control (strong)
     """
 
     def __init__(
@@ -239,59 +238,53 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
-        gamma_motion=0.01,        # <-- REQUIRED by train_local_sorting.py
+        gamma_motion=0.01,
         steps_per_action=1,
         obs_mode="local",
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
+
+        self.gamma_motion = gamma_motion
         self.steps_per_action = steps_per_action
         self.obs_mode = obs_mode
 
-        # dynamics
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # reward weights
-        self.interface_weight = 2.0
-        self.motion_weight = gamma_motion   # <-- mapped correctly
+        # reward weights (stable defaults)
+        self.energy_weight = 1.0
+        self.motion_weight = gamma_motion
+        self.mixing_weight = 5.0
 
         # bookkeeping
-        self._env_step = 0
         self.prev_mixing = None
+        self._env_step = 0
 
-    # ----------------------------------------------------------
-    # helpers
-    # ----------------------------------------------------------
-    def _make_morphogen(self, B):
-        x = torch.linspace(0, 1, self.W, device=self.device)
-        x = x.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
-        return x
+    # ------------------------------------------------------------------
+    # metrics
+    # ------------------------------------------------------------------
     def _sorting_index(self, state):
         """
-        Global left–right sorting metric.
-        Higher = better separation.
-        Returns: (B,)
+        Global left–right segregation metric.
         """
-        A = state[:, TYPE_A]   # (B, H, W)
-
-        mid = A.shape[-1] // 2
+        A = state[:, TYPE_A]  # (B,H,W)
+        mid = self.W // 2
         left = A[:, :, :mid].mean(dim=[1, 2])
         right = A[:, :, mid:].mean(dim=[1, 2])
-
         return torch.abs(left - right)
 
-
-    # ----------------------------------------------------------
-    # reset (stochastic but structured)
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
+    # reset
+    # ------------------------------------------------------------------
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
+        # smooth spatial noise
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
-        noise = torch.tanh(noise)
 
+        # orientation bias
         if torch.rand(1).item() < 0.5:
             bias = torch.linspace(-1, 1, self.W, device=self.device)
             bias = bias.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
@@ -299,97 +292,120 @@ class SortingEnv:
             bias = torch.linspace(-1, 1, self.H, device=self.device)
             bias = bias.view(1, 1, self.H, 1).repeat(B, 1, 1, self.W)
 
-        logits = 0.7 * noise + 0.6 * bias
+        logits = 0.7 * noise + 0.7 * bias
         probA = torch.sigmoid(logits)
 
-        types = torch.cat([probA, 1.0 - probA], dim=1)
+        types = torch.cat([probA, 1 - probA], dim=1)
         types = F.softmax(types, dim=1)
 
-        adhesion = torch.rand(B, 1, self.H, self.W, device=self.device) * 0.2 + 0.4
-        morphogen = self._make_morphogen(B)
+        adhesion = torch.full(
+            (B, 1, self.H, self.W),
+            0.5,
+            device=self.device,
+        )
+
+        morphogen = torch.linspace(
+            0, 1, self.W, device=self.device
+        ).view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
+
         center = torch.ones(B, 1, self.H, self.W, device=self.device)
 
         self.state = torch.cat(
             [types, adhesion, morphogen, center], dim=1
         ).detach()
 
-        with torch.no_grad():
-            self.prev_mixing = local_interface_mixing(self.state)
+        self.prev_mixing = local_interface_mixing(self.state).detach()
 
-        return self._get_obs()
+        if self.obs_mode == "local":
+            return extract_local_patches(self.state, patch_size=5)
+        else:
+            return self.state.clone()
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # step
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     def step(self, actions):
+        """
+        actions:
+          local mode -> (B, N, 3)
+          global mode -> (B, 3, H, W)
+        """
         B = self.state.shape[0]
         self._env_step += 1
-        # scale actions to adhesion modulation
-        adh = self.state[:, ADH:ADH+1]
-        adh = torch.clamp(
-            adh + 0.5 * actions[:, 0:1],   # << STRONG coupling
-            0.05,
-            1.0
-        )
 
-        self.state = torch.cat([
-            self.state[:, :ADH],
-            adh,
-            self.state[:, ADH+1:]
-        ], dim=1)
-
-
-        # reshape local actions
-        if actions.dim() == 3:
+        if self.obs_mode == "local":
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
         actions = actions.to(self.device)
 
+        # --------------------------------------------------------------
+        # 🔥 CRITICAL: action → adhesion coupling
+        # --------------------------------------------------------------
+        adh = self.state[:, ADH:ADH + 1]
+        adh = torch.clamp(
+            adh + 0.5 * actions[:, 0:1],  # strong control
+            0.05,
+            1.0,
+        )
+
+        self.state = torch.cat(
+            [
+                self.state[:, :ADH],
+                adh,
+                self.state[:, ADH + 1 :],
+            ],
+            dim=1,
+        )
+
+        # --------------------------------------------------------------
+        # DCA rollout
+        # --------------------------------------------------------------
         with torch.no_grad():
             s = self.state
             for _ in range(self.steps_per_action):
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-            mixing = local_interface_mixing(self.state)
-            mixing_gain = self.prev_mixing - mixing
-            self.prev_mixing = mixing.clone()
+        # --------------------------------------------------------------
+        # rewards
+        # --------------------------------------------------------------
+        mixing = local_interface_mixing(self.state)
+        delta_mixing = self.prev_mixing - mixing
+        self.prev_mixing = mixing.detach()
 
-            motion = actions.abs().mean(dim=[1, 2, 3])
+        energy = interfacial_energy(self.state)
+        motion = motion_penalty(actions)
 
-            reward = (
-                self.interface_weight * mixing_gain
-                - self.motion_weight * motion
+        reward = (
+            self.mixing_weight * delta_mixing
+            - self.energy_weight * energy
+            - self.motion_weight * motion
+        )
+
+        if self._env_step % 10 == 0:
+            print(
+                f"[ENV] step={self._env_step} "
+                f"mixing={mixing.mean():.4e} "
+                f"gain={delta_mixing.mean():+.4e} "
+                f"reward={reward.mean():+.4f}",
+                flush=True,
             )
 
-            if self._env_step % 10 == 0:
-                print(
-                    f"[ENV] step={self._env_step} "
-                    f"mixing={mixing.mean():.4e} "
-                    f"gain={mixing_gain.mean():+.4e} "
-                    f"reward={reward.mean():+.4f}",
-                    flush=True,
-                )
+        info = {
+            "mixing": mixing.detach().cpu(),
+            "delta_mixing": delta_mixing.detach().cpu(),
+            "energy": energy.detach().cpu(),
+            "motion": motion.detach().cpu(),
+            "sort_idx": self._sorting_index(self.state).detach().cpu(),
+        }
 
-            info = {
-                "mixing": mixing.detach().cpu(),
-                "mixing_gain": mixing_gain.detach().cpu(),
-                "motion": motion.detach().cpu(),
-            }
-
-        return self._get_obs(), reward, info
-
-    # ----------------------------------------------------------
-    # observations
-    # ----------------------------------------------------------
-    def _get_obs(self):
         if self.obs_mode == "local":
-            return extract_local_patches(self.state, patch_size=5)
-        if self.obs_mode == "global":
-            return self.state.clone()
-        patches, coords = extract_local_patches(self.state, patch_size=5)
-        return patches, coords
+            obs = extract_local_patches(self.state, patch_size=5)
+        else:
+            obs = self.state.clone()
 
-    # ----------------------------------------------------------
+        return obs, reward, info
+
+    # ------------------------------------------------------------------
     def current_state(self):
         return self.state.clone()
