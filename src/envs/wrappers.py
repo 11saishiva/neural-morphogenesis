@@ -206,7 +206,7 @@ from src.utils.metrics import extract_local_patches
 
 
 # ============================================================
-# Local interface mixing metric (DENSE, LOCAL, PPO-FRIENDLY)
+# Local interface mixing metric (dense, local, PPO-aligned)
 # ============================================================
 def local_interface_mixing(state):
     """
@@ -223,13 +223,13 @@ def local_interface_mixing(state):
 
 
 # ============================================================
-# Sorting Environment (FINAL)
+# Sorting Environment
 # ============================================================
 class SortingEnv:
     """
-    Local-sorting morphogenesis environment with
-    - stochastic structured init
-    - hybrid observations
+    Local-sorting morphogenesis environment with:
+    - stochastic structured initialization
+    - hybrid/local/global observations
     - dense local interface reward
     """
 
@@ -238,8 +238,9 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
+        gamma_motion=0.01,        # <-- REQUIRED by train_local_sorting.py
         steps_per_action=1,
-        obs_mode="hybrid",   # local + global channels
+        obs_mode="local",
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
@@ -250,9 +251,9 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # reward weights (CRITICAL: tuned for scale)
+        # reward weights
         self.interface_weight = 2.0
-        self.motion_weight = 0.1
+        self.motion_weight = gamma_motion   # <-- mapped correctly
 
         # bookkeeping
         self._env_step = 0
@@ -267,17 +268,15 @@ class SortingEnv:
         return x
 
     # ----------------------------------------------------------
-    # reset (stochastic, structured)
+    # reset (stochastic but structured)
     # ----------------------------------------------------------
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
-        # smooth spatial noise
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
         noise = torch.tanh(noise)
 
-        # random global bias direction
         if torch.rand(1).item() < 0.5:
             bias = torch.linspace(-1, 1, self.W, device=self.device)
             bias = bias.view(1, 1, 1, self.W).repeat(B, 1, self.H, 1)
@@ -311,7 +310,7 @@ class SortingEnv:
         B = self.state.shape[0]
         self._env_step += 1
 
-        # reshape actions if local
+        # reshape local actions
         if actions.dim() == 3:
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
@@ -323,7 +322,6 @@ class SortingEnv:
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-            # ---------------- reward ----------------
             mixing = local_interface_mixing(self.state)
             mixing_gain = self.prev_mixing - mixing
             self.prev_mixing = mixing.clone()
@@ -353,16 +351,13 @@ class SortingEnv:
         return self._get_obs(), reward, info
 
     # ----------------------------------------------------------
-    # hybrid observation
+    # observations
     # ----------------------------------------------------------
     def _get_obs(self):
         if self.obs_mode == "local":
             return extract_local_patches(self.state, patch_size=5)
-
         if self.obs_mode == "global":
             return self.state.clone()
-
-        # HYBRID (recommended)
         patches, coords = extract_local_patches(self.state, patch_size=5)
         return patches, coords
 
