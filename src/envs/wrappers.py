@@ -338,49 +338,37 @@ class SortingEnv:
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
+            # --- purity ---
             purity = self._sorting_index(self.state)
-            # normalized purity gain
-            purity_gain = (purity - self.initial_purity)
 
-            raw_reward = (
-                5.0 * purity_gain           # <-- strong, dense signal
-                - self.energy_weight * energy
-                - self.motion_weight * motion
-            )
+            # baseline-relative shaping (CORRECT)
+            purity_gain = purity - self.initial_purity
 
-            self.prev_purity = purity.clone()
-
+            # --- penalties (YOU MUST COMPUTE THESE) ---
             energy = interfacial_energy(self.state)
             motion = motion_penalty(actions)
 
-            raw_reward = (
-                self.purity_delta_weight * delta_purity
-                + self.purity_anchor_weight * purity
+            # --- reward ---
+            reward = (
+                5.0 * purity_gain
                 - self.energy_weight * energy
                 - self.motion_weight * motion
-            )
-
-            self.reward_rms.update(raw_reward)
-            reward = self.reward_rms.normalize(raw_reward)
-            # curriculum decay
-            self.purity_delta_weight = max(
-                50.0, self.purity_delta_weight * 0.9995
             )
 
             if self._env_step % 10 == 0:
                 print(
                     f"[ENV] step={self._env_step} "
                     f"purity={purity.mean():.4e} "
-                    f"Δpurity={delta_purity.mean():+.3e} "
-                    f"reward={reward.mean():.4f}",
+                    f"gain={purity_gain.mean():+.4e} "
+                    f"reward={reward.mean().item():+.4f}",
                     flush=True,
                 )
 
             info = {
-                "purity": purity.cpu(),
-                "delta_purity": delta_purity.cpu(),
-                "energy": energy.cpu(),
-                "motion": motion.cpu(),
+                "purity": purity.detach().cpu(),
+                "purity_gain": purity_gain.detach().cpu(),
+                "energy": energy.detach().cpu(),
+                "motion": motion.detach().cpu(),
             }
 
         return self._get_observation(), reward, info
