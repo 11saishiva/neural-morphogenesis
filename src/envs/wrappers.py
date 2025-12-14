@@ -214,12 +214,13 @@ def local_interface_mixing(state):
     Lower is better.
     Returns: (B,)
     """
-    A = state[:, TYPE_A]  # (B,H,W)
+    A = state[:, TYPE_A]   # (B, H, W)
 
-    dx = torch.abs(A[:, :, :, 1:] - A[:, :, :, :-1])
-    dy = torch.abs(A[:, :, 1:, :] - A[:, :, :-1, :])
+    dx = torch.abs(A[:, :, 1:] - A[:, :, :-1])   # horizontal edges
+    dy = torch.abs(A[:, 1:, :] - A[:, :-1, :])   # vertical edges
 
     return dx.mean(dim=[1, 2]) + dy.mean(dim=[1, 2])
+
 
 
 # ============================================================
