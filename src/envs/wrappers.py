@@ -234,9 +234,9 @@ class SortingEnv:
         H=64,
         W=64,
         device="cpu",
-        gamma_motion=0.01,          # <-- REQUIRED FIX
+        gamma_motion=0.01,
         steps_per_action=1,
-        obs_mode="local",           # "local" or "hybrid"
+        obs_mode="local",
     ):
         self.H, self.W = H, W
         self.device = torch.device(device)
@@ -247,11 +247,13 @@ class SortingEnv:
         self.dca = DCA().to(self.device)
         self.state = None
 
-        # reward weights
-        self.mixing_weight = 2.0
-        self.energy_weight = 1.0
-        self.motion_weight = gamma_motion     # <-- mapped correctly
-        self.persistence_weight = 0.002
+        # -------------------------------
+        # Reward weights (FIXED)
+        # -------------------------------
+        self.mixing_weight = 1000.0        # amplify real signal
+        self.energy_weight = 0.01          # very weak penalty
+        self.motion_weight = gamma_motion  # weak regularizer
+        self.persistence_weight = 0.05     # meaningful bonus
 
         # bookkeeping
         self.prev_mixing = None
@@ -264,7 +266,6 @@ class SortingEnv:
     def reset(self, B=1, pA=0.5):
         self._env_step = 0
 
-        # low-frequency stochastic init
         noise = torch.randn(B, 1, self.H, self.W, device=self.device)
         noise = F.avg_pool2d(noise, kernel_size=9, stride=1, padding=4)
         noise = torch.tanh(noise)
@@ -297,7 +298,6 @@ class SortingEnv:
         B = self.state.shape[0]
         self._env_step += 1
 
-        # reshape local actions
         if self.obs_mode in ["local", "hybrid"]:
             actions = actions.transpose(1, 2).reshape(B, 3, self.H, self.W)
 
@@ -309,14 +309,13 @@ class SortingEnv:
                 s = self.dca(s, actions, steps=1)
             self.state = s.detach()
 
-            # ----------------------------------------------------------
-            # metrics
-            # ----------------------------------------------------------
+            # -----------------------------
+            # Metrics
+            # -----------------------------
             mixing = local_interface_mixing(self.state)
             delta_mixing = self.prev_mixing - mixing
             self.prev_mixing = mixing.clone()
 
-            # persistence
             threshold = 9e-4
             is_sorted = (mixing < threshold).float()
             self.sorted_steps = is_sorted * (self.sorted_steps + 1)
@@ -326,15 +325,18 @@ class SortingEnv:
             energy = (self.state[:, ADH] ** 2).mean(dim=(1, 2))
             motion = actions.abs().mean(dim=(1, 2, 3))
 
-            # ----------------------------------------------------------
-            # reward
-            # ----------------------------------------------------------
+            # -----------------------------
+            # FIXED reward
+            # -----------------------------
             reward = (
                 self.mixing_weight * delta_mixing
                 + persistence_bonus
                 - self.energy_weight * energy
                 - self.motion_weight * motion
             )
+
+            # optional but safe
+            reward = torch.clamp(reward, -1.0, 1.0)
 
             if self._env_step % 10 == 0:
                 print(
@@ -354,20 +356,16 @@ class SortingEnv:
             }
 
         return self._get_obs(), reward, info
-    def _sorting_index(self, state):
-        """
-        Legacy metric expected by train_local_sorting.py
-        Measures left-right separation of TYPE_A cells.
-        Returns: (B,)
-        """
-        A = state[:, TYPE_A]  # (B, H, W)
-        mid = A.shape[-1] // 2
 
+    # -----------------------------------------------------------------
+    # Legacy metric (required)
+    # -----------------------------------------------------------------
+    def _sorting_index(self, state):
+        A = state[:, TYPE_A]
+        mid = A.shape[-1] // 2
         left = A[:, :, :mid].mean(dim=(1, 2))
         right = A[:, :, mid:].mean(dim=(1, 2))
-
         return torch.abs(left - right)
-
 
     # -----------------------------------------------------------------
     # Observation
@@ -383,6 +381,5 @@ class SortingEnv:
 
         return self.state.clone()
 
-    # -----------------------------------------------------------------
     def current_state(self):
         return self.state.clone()
