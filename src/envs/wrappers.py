@@ -354,6 +354,20 @@ class SortingEnv:
             }
 
         return self._get_obs(), reward, info
+    def _sorting_index(self, state):
+        """
+        Legacy metric expected by train_local_sorting.py
+        Measures left-right separation of TYPE_A cells.
+        Returns: (B,)
+        """
+        A = state[:, TYPE_A]  # (B, H, W)
+        mid = A.shape[-1] // 2
+
+        left = A[:, :, :mid].mean(dim=(1, 2))
+        right = A[:, :, mid:].mean(dim=(1, 2))
+
+        return torch.abs(left - right)
+
 
     # -----------------------------------------------------------------
     # Observation
